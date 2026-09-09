@@ -139,10 +139,6 @@ func (s *service) Upload(ctx context.Context, requester domain.User, input Uploa
 	return domain.Document{}, mapRepositoryError(err)
 }
 
-func (s *service) Get(context.Context, domain.User, string) (Content, error) {
-	return Content{}, domain.ErrNotImplemented
-}
-
 func (s *service) Delete(context.Context, domain.User, string) error {
 	return domain.ErrNotImplemented
 }

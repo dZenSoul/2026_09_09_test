@@ -152,7 +152,15 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request) {
 		}
 		h.operation(w, r, http.MethodGet, http.MethodHead, http.MethodPost)
 	case singlePathValue(path, "/api/docs/"):
-		h.operation(w, r, http.MethodDelete, http.MethodGet, http.MethodHead)
+		if r.Method == http.MethodGet || r.Method == http.MethodHead {
+			h.readDocument(w, r, strings.TrimPrefix(path, "/api/docs/"))
+			return
+		}
+		if r.Method == http.MethodDelete {
+			h.operation(w, r, http.MethodDelete)
+			return
+		}
+		methodNotAllowed(w, http.MethodDelete, http.MethodGet, http.MethodHead)
 	default:
 		writeAPIError(w, http.StatusNotFound, errorCodeNotFound, "resource not found")
 	}
