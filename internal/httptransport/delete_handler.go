@@ -35,7 +35,11 @@ func (h *handler) deleteDocument(w http.ResponseWriter, r *http.Request, id stri
 		writeDomainError(w, err)
 		return
 	}
-	if h.deps.Cache != nil {
+	invalidatedByService := false
+	if service, ok := h.deps.Documents.(interface{ InvalidatesDeleteCache() bool }); ok {
+		invalidatedByService = service.InvalidatesDeleteCache()
+	}
+	if h.deps.Cache != nil && !invalidatedByService {
 		h.cacheEpoch.Add(1)
 		h.deps.Cache.Invalidate(context.WithoutCancel(r.Context()), listCacheTag, "document:"+id)
 		h.observeCacheSize()

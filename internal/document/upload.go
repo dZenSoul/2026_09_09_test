@@ -11,6 +11,7 @@ import (
 	"mime"
 	"path/filepath"
 	"strings"
+	"time"
 	"unicode"
 
 	"documents/internal/blob"
@@ -27,16 +28,26 @@ type Config struct {
 	MaxGrantItems int
 	MaxListLimit  int
 	Rand          io.Reader
+	// Cleanup may be omitted when documents itself implements the cleanup
+	// repository (as the PostgreSQL repository does).
+	Cleanup repository.BlobCleanupRepository
+	// InvalidateDelete runs after the metadata transaction commits and before
+	// the immediate blob deletion starts.
+	InvalidateDelete func(context.Context, string) error
+	CleanupTimeout   time.Duration
 }
 
 type service struct {
-	documents repository.DocumentRepository
-	users     repository.UserRepository
-	blobs     blob.Storage
-	maxFile   int64
-	maxGrants int
-	maxList   int
-	rand      io.Reader
+	documents        repository.DocumentRepository
+	users            repository.UserRepository
+	blobs            blob.Storage
+	maxFile          int64
+	maxGrants        int
+	maxList          int
+	rand             io.Reader
+	cleanup          repository.BlobCleanupRepository
+	invalidateDelete func(context.Context, string) error
+	cleanupTimeout   time.Duration
 }
 
 func NewService(documents repository.DocumentRepository, users repository.UserRepository, blobs blob.Storage, cfg Config) (Service, error) {
@@ -51,9 +62,18 @@ func NewService(documents repository.DocumentRepository, users repository.UserRe
 	if maxList <= 0 {
 		maxList = 100
 	}
+	cleanup := cfg.Cleanup
+	if cleanup == nil {
+		cleanup, _ = documents.(repository.BlobCleanupRepository)
+	}
+	cleanupTimeout := cfg.CleanupTimeout
+	if cleanupTimeout <= 0 {
+		cleanupTimeout = 5 * time.Second
+	}
 	return &service{
 		documents: documents, users: users, blobs: blobs,
 		maxFile: cfg.MaxFileBytes, maxGrants: cfg.MaxGrantItems, maxList: maxList, rand: random,
+		cleanup: cleanup, invalidateDelete: cfg.InvalidateDelete, cleanupTimeout: cleanupTimeout,
 	}, nil
 }
 
@@ -213,3 +233,7 @@ func mapRepositoryError(err error) error {
 }
 
 var _ Service = (*service)(nil)
+
+// InvalidatesDeleteCache lets transports avoid duplicating the service's
+// post-commit invalidation hook.
+func (s *service) InvalidatesDeleteCache() bool { return s.invalidateDelete != nil }

@@ -37,7 +37,28 @@ type DocumentRepository interface {
 	ByID(ctx context.Context, id string) (domain.Document, error)
 	ByIDAccessible(ctx context.Context, id, requesterID string) (domain.Document, error)
 	List(ctx context.Context, requesterID string, filter domain.DocumentFilter) ([]domain.Document, error)
+	// Delete locks and checks the document, removes it and its grants, and for
+	// a file atomically enqueues a blob cleanup task before committing.
 	Delete(ctx context.Context, id, ownerID string) (domain.Document, error)
+}
+
+// BlobCleanupTask is an outbox entry for deleting an opaque blob. It has no
+// foreign key to documents so deleting document metadata cannot make the
+// cleanup work disappear.
+type BlobCleanupTask struct {
+	ID            int64
+	StorageKey    string
+	Attempts      int
+	NextAttemptAt time.Time
+}
+
+// BlobCleanupRepository coordinates immediate and background blob cleanup.
+// Claim leases due tasks so several workers can safely share one queue.
+type BlobCleanupRepository interface {
+	ClaimBlobCleanupTasks(ctx context.Context, limit int, leaseUntil time.Time) ([]BlobCleanupTask, error)
+	CompleteBlobCleanupTask(ctx context.Context, id int64) error
+	CompleteBlobCleanupByStorageKey(ctx context.Context, storageKey string) error
+	RetryBlobCleanupTask(ctx context.Context, id int64, nextAttemptAt time.Time) error
 }
 
 // Transactor lets services keep multi-step metadata changes atomic without

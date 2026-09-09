@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 
 	"documents/internal/auth"
@@ -63,21 +64,39 @@ func run() error {
 		return err
 	}
 	defer blobStorage.Close()
+
+	cache := responsecache.NewMemory(cfg.CacheMaxBytes, cfg.CacheMaxItems)
+	defer cache.Close()
+	cacheEpoch := &atomic.Uint64{}
 	documentService, err := document.NewService(store.Documents(), store.Users(), blobStorage, document.Config{
-		MaxFileBytes:  cfg.MaxFileBytes,
-		MaxGrantItems: cfg.MaxGrantItems,
-		MaxListLimit:  cfg.MaxListLimit,
+		MaxFileBytes:   cfg.MaxFileBytes,
+		MaxGrantItems:  cfg.MaxGrantItems,
+		MaxListLimit:   cfg.MaxListLimit,
+		Cleanup:        store,
+		CleanupTimeout: cfg.HTTPProcessingTimeout,
+		InvalidateDelete: func(ctx context.Context, id string) error {
+			cacheEpoch.Add(1)
+			cache.Invalidate(ctx, "documents:list", "document:"+id)
+			bytes, items := cache.Stats()
+			metrics.SetCacheSize(bytes, items)
+			return ctx.Err()
+		},
 	})
 	if err != nil {
 		return err
 	}
 
-	cache := responsecache.NewMemory(cfg.CacheMaxBytes, cfg.CacheMaxItems)
-	defer cache.Close()
+	cleanupWorker, err := document.NewCleanupWorker(store, blobStorage, document.CleanupWorkerConfig{
+		OperationTimeout: cfg.HTTPProcessingTimeout,
+	})
+	if err != nil {
+		return err
+	}
 	handler := httptransport.NewHandler(httptransport.Dependencies{
 		Auth:              authService,
 		Documents:         documentService,
 		Cache:             cache,
+		CacheEpoch:        cacheEpoch,
 		CacheTTL:          cfg.CacheTTL,
 		ExposeCacheHeader: cfg.ExposeCacheHeader,
 		Logger:            logger,
@@ -110,6 +129,16 @@ func run() error {
 	}
 
 	serveErr := make(chan error, 1)
+	workerCtx, stopWorker := context.WithCancel(context.Background())
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		_ = cleanupWorker.Run(workerCtx)
+	}()
+	defer func() {
+		stopWorker()
+		<-workerDone
+	}()
 	go func() {
 		logger.Info("HTTP server starting", "address", server.Addr)
 		serveErr <- server.ListenAndServe()
@@ -125,6 +154,7 @@ func run() error {
 		}
 		return err
 	case <-signalCtx.Done():
+		stopWorker()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.GracefulShutdownTimeout)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {

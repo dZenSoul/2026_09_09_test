@@ -52,8 +52,8 @@ func TestPostgresRepositoriesIntegration(t *testing.T) {
 		t.Fatalf("second MigrateUp() error = %v", err)
 	}
 	var versions int
-	if err := store.pool.QueryRow(ctx, "SELECT count(*) FROM schema_migrations").Scan(&versions); err != nil || versions != 1 {
-		t.Fatalf("migration versions = %d, %v; want 1", versions, err)
+	if err := store.pool.QueryRow(ctx, "SELECT count(*) FROM schema_migrations").Scan(&versions); err != nil || versions != 2 {
+		t.Fatalf("migration versions = %d, %v; want 2", versions, err)
 	}
 
 	users := store.Users()
@@ -160,8 +160,53 @@ func TestPostgresRepositoriesIntegration(t *testing.T) {
 		t.Fatalf("repeat delete error = %v, want not found", err)
 	}
 
+	file := mustCreateDocument(t, ctx, documents, domain.Document{
+		OwnerID: alice.ID, Name: "file", MIME: "application/octet-stream",
+		IsFile: true, StorageKey: "opaque-file-key", SizeBytes: 12,
+	})
+	err = store.WithinTransaction(ctx, func(txCtx context.Context) error {
+		if _, err := documents.Delete(txCtx, file.ID, alice.ID); err != nil {
+			return err
+		}
+		return rollbackMarker
+	})
+	if !errors.Is(err, rollbackMarker) {
+		t.Fatalf("file deletion rollback error = %v", err)
+	}
+	if _, err := documents.ByID(ctx, file.ID); err != nil {
+		t.Fatalf("file metadata lost on rollback: %v", err)
+	}
+	var cleanupTasks int
+	if err := store.pool.QueryRow(ctx, "SELECT count(*) FROM blob_cleanup_tasks WHERE storage_key = $1", file.StorageKey).Scan(&cleanupTasks); err != nil || cleanupTasks != 0 {
+		t.Fatalf("cleanup task survived rollback: count=%d error=%v", cleanupTasks, err)
+	}
+	if _, err := documents.Delete(ctx, file.ID, alice.ID); err != nil {
+		t.Fatalf("delete file metadata: %v", err)
+	}
+	claimed, err := store.ClaimBlobCleanupTasks(ctx, 1, time.Now().Add(time.Minute))
+	if err != nil || len(claimed) != 1 || claimed[0].StorageKey != file.StorageKey || claimed[0].Attempts != 1 {
+		t.Fatalf("claimed cleanup tasks = %#v, error = %v", claimed, err)
+	}
+	claimedAgain, err := store.ClaimBlobCleanupTasks(ctx, 1, time.Now().Add(time.Minute))
+	if err != nil || len(claimedAgain) != 0 {
+		t.Fatalf("leased task claimed concurrently = %#v, error = %v", claimedAgain, err)
+	}
+	if err := store.RetryBlobCleanupTask(ctx, claimed[0].ID, time.Now().Add(-time.Second)); err != nil {
+		t.Fatalf("retry cleanup task: %v", err)
+	}
+	claimedAgain, err = store.ClaimBlobCleanupTasks(ctx, 1, time.Now().Add(time.Minute))
+	if err != nil || len(claimedAgain) != 1 || claimedAgain[0].Attempts != 2 {
+		t.Fatalf("reclaimed cleanup task = %#v, error = %v", claimedAgain, err)
+	}
+	if err := store.CompleteBlobCleanupTask(ctx, claimedAgain[0].ID); err != nil {
+		t.Fatalf("complete cleanup task: %v", err)
+	}
+
 	if err := store.MigrateDown(ctx); err != nil {
 		t.Fatalf("MigrateDown() error = %v", err)
+	}
+	if err := store.MigrateDown(ctx); err != nil {
+		t.Fatalf("second MigrateDown() error = %v", err)
 	}
 	var usersTable *string
 	if err := store.pool.QueryRow(ctx, "SELECT to_regclass('users')::text").Scan(&usersTable); err != nil || usersTable != nil {

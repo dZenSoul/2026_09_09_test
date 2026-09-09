@@ -201,6 +201,14 @@ func (s *Store) Delete(ctx context.Context, id, ownerID string) (domain.Document
 		if err != nil {
 			return err
 		}
+		if deleted.IsFile {
+			if _, err := s.executor(txCtx).Exec(txCtx, `
+                INSERT INTO blob_cleanup_tasks (storage_key)
+                VALUES ($1)
+                ON CONFLICT (storage_key) DO NOTHING`, deleted.StorageKey); err != nil {
+				return classify("enqueue blob cleanup", err)
+			}
+		}
 		tag, err := s.executor(txCtx).Exec(txCtx, "DELETE FROM documents WHERE id = $1", id)
 		if err != nil {
 			return classify("delete document", err)

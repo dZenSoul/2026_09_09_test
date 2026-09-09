@@ -40,9 +40,12 @@ type Limits struct {
 }
 
 type Dependencies struct {
-	Auth              auth.Service
-	Documents         document.Service
-	Cache             responsecache.Cache
+	Auth      auth.Service
+	Documents document.Service
+	Cache     responsecache.Cache
+	// CacheEpoch may be shared with a service-level invalidation hook so loads
+	// already in flight at deletion time cannot repopulate an addressable key.
+	CacheEpoch        *atomic.Uint64
 	CacheTTL          time.Duration
 	ExposeCacheHeader bool
 	Logger            *slog.Logger
@@ -62,7 +65,7 @@ type Dependencies struct {
 type handler struct {
 	deps       Dependencies
 	loads      singleflight.Group
-	cacheEpoch atomic.Uint64
+	cacheEpoch *atomic.Uint64
 }
 
 type contextKey uint8
@@ -104,7 +107,10 @@ func NewHandler(deps Dependencies) http.Handler {
 	if deps.Cache != nil && deps.CacheTTL <= 0 {
 		deps.CacheTTL = 5 * time.Minute
 	}
-	return &handler{deps: deps}
+	if deps.CacheEpoch == nil {
+		deps.CacheEpoch = &atomic.Uint64{}
+	}
+	return &handler{deps: deps, cacheEpoch: deps.CacheEpoch}
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
