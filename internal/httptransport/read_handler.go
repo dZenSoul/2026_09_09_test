@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
 
 	responsecache "documents/internal/cache"
 	"documents/internal/document"
@@ -133,6 +134,7 @@ func (h *handler) readFileWithCache(w http.ResponseWriter, r *http.Request, requ
 		writeAPIError(w, http.StatusInternalServerError, errorCodeInternal, "internal server error")
 		return
 	}
+	content.File = newCloseOnceReader(content.File)
 	defer content.File.Close()
 
 	entry = fileMetadataEntry(content.Document, tags)
@@ -143,12 +145,12 @@ func (h *handler) readFileWithCache(w http.ResponseWriter, r *http.Request, requ
 	if !cacheBody {
 		h.deps.Cache.Set(context.WithoutCancel(r.Context()), key, entry, h.deps.CacheTTL)
 		h.observeCacheSize()
-		_ = writeFileStream(w, content, nil)
+		_ = writeFileStream(r.Context(), w, content, nil)
 		return
 	}
 
 	capture := &boundedCapture{remaining: content.Document.SizeBytes}
-	if err := writeFileStream(w, content, capture); err != nil || capture.overflow || int64(capture.buffer.Len()) != content.Document.SizeBytes {
+	if err := writeFileStream(r.Context(), w, content, capture); err != nil || capture.overflow || int64(capture.buffer.Len()) != content.Document.SizeBytes {
 		return
 	}
 	entry.Body = capture.buffer.Bytes()
@@ -204,9 +206,10 @@ func (h *handler) loadDocumentContent(w http.ResponseWriter, r *http.Request, re
 		return false
 	}
 	if content.File != nil {
+		content.File = newCloseOnceReader(content.File)
 		defer content.File.Close()
 	}
-	return writeDocumentContent(w, content) == nil
+	return writeDocumentContent(r.Context(), w, content) == nil
 }
 
 func writeDocumentMetadata(w http.ResponseWriter, metadata domain.Document) {
@@ -218,7 +221,7 @@ func writeDocumentMetadata(w http.ResponseWriter, metadata domain.Document) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func writeDocumentContent(w http.ResponseWriter, content document.Content) error {
+func writeDocumentContent(ctx context.Context, w http.ResponseWriter, content document.Content) error {
 	if !content.Document.IsFile {
 		writeData(w, http.StatusOK, json.RawMessage(content.Document.JSON))
 		return nil
@@ -227,13 +230,15 @@ func writeDocumentContent(w http.ResponseWriter, content document.Content) error
 		writeAPIError(w, http.StatusInternalServerError, errorCodeInternal, "internal server error")
 		return errors.New("file document has no body")
 	}
-	return writeFileStream(w, content, nil)
+	return writeFileStream(ctx, w, content, nil)
 }
 
-func writeFileStream(w http.ResponseWriter, content document.Content, capture io.Writer) error {
+func writeFileStream(ctx context.Context, w http.ResponseWriter, content document.Content, capture io.Writer) error {
 	writeFileHeaders(w, content.Document)
 	beginStreaming(w)
 	w.WriteHeader(http.StatusOK)
+	stopClose := closeReaderOnCancellation(ctx, content.File)
+	defer stopClose()
 	destination := io.Writer(w)
 	if capture != nil {
 		destination = io.MultiWriter(w, capture)
@@ -243,6 +248,44 @@ func writeFileStream(w http.ResponseWriter, content document.Content, capture io
 	// whole object in one call.
 	_, err := io.CopyBuffer(destination, readerOnly{Reader: content.File}, make([]byte, fileCopyBufferBytes))
 	return err
+}
+
+type closeOnceReader struct {
+	io.ReadCloser
+	once sync.Once
+}
+
+func newCloseOnceReader(reader io.ReadCloser) io.ReadCloser {
+	if _, ok := reader.(*closeOnceReader); ok {
+		return reader
+	}
+	return &closeOnceReader{ReadCloser: reader}
+}
+
+func (r *closeOnceReader) Close() error {
+	var err error
+	r.once.Do(func() { err = r.ReadCloser.Close() })
+	return err
+}
+
+func closeReaderOnCancellation(ctx context.Context, reader io.ReadCloser) func() {
+	if ctx.Done() == nil {
+		return func() {}
+	}
+	stopped := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		select {
+		case <-ctx.Done():
+			_ = reader.Close()
+		case <-stopped:
+		}
+	}()
+	return func() {
+		close(stopped)
+		<-finished
+	}
 }
 
 type readerOnly struct{ io.Reader }

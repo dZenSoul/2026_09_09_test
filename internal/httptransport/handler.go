@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -72,7 +73,22 @@ type contextKey uint8
 
 const requestIDKey contextKey = iota
 
-type requestObservation struct{ cache string }
+type requestObservation struct {
+	mu    sync.Mutex
+	cache string
+}
+
+func (o *requestObservation) setCache(value string) {
+	o.mu.Lock()
+	o.cache = value
+	o.mu.Unlock()
+}
+
+func (o *requestObservation) cacheResult() string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.cache
+}
 
 const observationKey contextKey = requestIDKey + 1
 
@@ -114,15 +130,16 @@ func NewHandler(deps Dependencies) http.Handler {
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	var cancel context.CancelFunc
 	if h.deps.ProcessingTimeout > 0 {
-		ctx, cancel := context.WithTimeout(r.Context(), h.deps.ProcessingTimeout)
-		defer cancel()
+		var ctx context.Context
+		ctx, cancel = context.WithTimeout(r.Context(), h.deps.ProcessingTimeout)
 		r = r.WithContext(ctx)
 	}
-	h.serveHTTP(w, r, http.HandlerFunc(h.route))
+	h.serveHTTP(w, r, http.HandlerFunc(h.route), cancel)
 }
 
-func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request, next http.Handler) {
+func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request, next http.Handler, cancels ...context.CancelFunc) {
 	started := time.Now()
 	requestID := uuid.NewString()
 	w.Header().Set("X-Request-ID", requestID)
@@ -130,52 +147,99 @@ func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request, next http.Ha
 	ctx := context.WithValue(r.Context(), requestIDKey, requestID)
 	r = r.WithContext(context.WithValue(ctx, observationKey, observation))
 
-	response := newObservedResponse(w, r.Method == http.MethodHead)
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			h.deps.Logger.Error("HTTP handler panic recovered",
-				"request_id", requestID,
-				"route", normalizedRoute(r.URL.Path),
-				"method", r.Method,
-			)
-			// Once streaming has started the status and partial body are already on
-			// the wire. Appending a JSON error would only corrupt that response.
-			if !response.committed {
-				requestIDHeader := response.Header().Get("X-Request-ID")
-				response.reset()
-				response.Header().Set("X-Request-ID", requestIDHeader)
-				writeAPIError(response, http.StatusInternalServerError, errorCodeInternal, "internal server error")
+	var timeout <-chan struct{}
+	if len(cancels) != 0 && cancels[0] != nil {
+		timeout = r.Context().Done()
+	}
+	response := newObservedResponse(w, r.Method == http.MethodHead, timeout)
+	done := make(chan any, 1)
+	go func() {
+		var recovered any
+		defer func() {
+			if value := recover(); value != nil {
+				recovered = value
 			}
+			done <- recovered
+		}()
+
+		if r.ContentLength > h.deps.Limits.MaxRequestBytes {
+			writeAPIError(response, http.StatusBadRequest, errorCodeBadRequest, "request body is too large")
+			return
 		}
-		response.finish()
-		status := response.status
-		if status == 0 {
-			status = http.StatusOK
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(response, r.Body, h.deps.Limits.MaxRequestBytes)
 		}
-		duration := time.Since(started)
-		log := h.deps.Logger.Info
-		if status >= 500 {
-			log = h.deps.Logger.Error
-		}
-		log("HTTP request completed", "request_id", requestID, "route", normalizedRoute(r.URL.Path),
-			"method", r.Method, "status", status, "duration_ms", duration.Milliseconds(), "cache", observation.cache)
-		if h.deps.Metrics != nil {
-			h.deps.Metrics.ObserveRequest(normalizedRoute(r.URL.Path), r.Method, status, duration.Seconds())
-			if disposition := response.Header().Get("Content-Disposition"); r.Method != http.MethodHead && disposition != "" {
-				h.deps.Metrics.ObserveFile("download", response.bytesWritten)
-			}
-		}
+		next.ServeHTTP(response, r)
 	}()
 
-	if r.ContentLength > h.deps.Limits.MaxRequestBytes {
-		writeAPIError(response, http.StatusBadRequest, errorCodeBadRequest, "request body is too large")
-		return
+	timedOut := false
+	streamingTimeout := false
+	var recovered any
+	select {
+	case recovered = <-done:
+		// Prefer the configured deadline when handler completion and the timer
+		// become observable together. This makes the boundary deterministic and
+		// prevents a context-error response from replacing the timeout contract.
+		select {
+		case <-timeout:
+			timedOut = true
+			streamingTimeout = response.timeout(requestID)
+		default:
+			if recovered != nil {
+				h.deps.Logger.Error("HTTP handler panic recovered",
+					"request_id", requestID,
+					"route", normalizedRoute(r.URL.Path),
+					"method", r.Method,
+				)
+				// Once streaming has started the status and partial body are already on
+				// the wire. Appending a JSON error would only corrupt that response.
+				response.replaceWithInternalError()
+			}
+			response.finish()
+		}
+	case <-timeout:
+		// A processing deadline owns the response only when it wins the race
+		// against handler completion. Cancel first so database and blob work can
+		// stop while the timeout response is being committed.
+		if len(cancels) != 0 && cancels[0] != nil {
+			cancels[0]()
+		}
+		timedOut = true
+		streamingTimeout = response.timeout(requestID)
 	}
-	if r.Body != nil {
-		r.Body = http.MaxBytesReader(response, r.Body, h.deps.Limits.MaxRequestBytes)
+	if len(cancels) != 0 && cancels[0] != nil {
+		cancels[0]()
 	}
 
-	next.ServeHTTP(response, r)
+	status := response.statusCode()
+	duration := time.Since(started)
+	log := h.deps.Logger.Info
+	if status >= 500 || timedOut {
+		log = h.deps.Logger.Error
+	}
+	outcome := "completed"
+	if timedOut {
+		outcome = "timeout"
+		if streamingTimeout {
+			outcome = "streaming_timeout"
+		}
+	}
+	log("HTTP request completed", "request_id", requestID, "route", normalizedRoute(r.URL.Path),
+		"method", r.Method, "status", status, "duration_ms", duration.Milliseconds(),
+		"cache", observation.cacheResult(), "outcome", outcome)
+	if h.deps.Metrics != nil {
+		h.deps.Metrics.ObserveRequest(normalizedRoute(r.URL.Path), r.Method, status, duration.Seconds())
+		if timedOut {
+			if metrics, ok := h.deps.Metrics.(interface {
+				ObserveTimeout(route, method string, streaming bool)
+			}); ok {
+				metrics.ObserveTimeout(normalizedRoute(r.URL.Path), r.Method, streamingTimeout)
+			}
+		}
+		if disposition := response.responseHeader().Get("Content-Disposition"); r.Method != http.MethodHead && disposition != "" {
+			h.deps.Metrics.ObserveFile("download", response.writtenBytes())
+		}
+	}
 }
 
 func (h *handler) route(w http.ResponseWriter, r *http.Request) {
@@ -342,91 +406,141 @@ type observedResponse struct {
 	head         bool
 	header       http.Header
 	body         bytes.Buffer
-	status       int
+	status       atomic.Int32
 	wroteHeader  bool
-	committed    bool
-	bytesWritten int64
+	state        atomic.Int32
+	streamMu     sync.Mutex
+	bytesWritten atomic.Int64
+	timeoutDone  <-chan struct{}
 }
 
-func newObservedResponse(dst http.ResponseWriter, head bool) *observedResponse {
-	return &observedResponse{dst: dst, head: head, header: cloneHeader(dst.Header())}
+const (
+	responsePending int32 = iota
+	responseStreaming
+	responseCompleted
+	responseTimedOut
+	responseStreamingTimedOut
+)
+
+func newObservedResponse(dst http.ResponseWriter, head bool, timeoutDone ...<-chan struct{}) *observedResponse {
+	w := &observedResponse{dst: dst, head: head, header: cloneHeader(dst.Header())}
+	if len(timeoutDone) != 0 {
+		w.timeoutDone = timeoutDone[0]
+	}
+	return w
+}
+
+func (w *observedResponse) deadlineExceeded() bool {
+	select {
+	case <-w.timeoutDone:
+		return true
+	default:
+		return false
+	}
 }
 
 func (w *observedResponse) Header() http.Header {
-	if w.committed {
+	if w.state.Load() == responseStreaming {
 		return w.dst.Header()
 	}
 	return w.header
 }
 
 func (w *observedResponse) WriteHeader(status int) {
+	if w.deadlineExceeded() {
+		return
+	}
 	if w.wroteHeader {
 		return
 	}
-	w.status = status
+	w.status.Store(int32(status))
 	w.wroteHeader = true
-	if w.committed {
+	if w.state.Load() == responseStreaming {
+		w.streamMu.Lock()
+		defer w.streamMu.Unlock()
+		if w.state.Load() != responseStreaming || w.deadlineExceeded() {
+			return
+		}
 		w.dst.WriteHeader(status)
 	}
 }
 
 func (w *observedResponse) Write(data []byte) (int, error) {
+	if w.deadlineExceeded() {
+		return 0, http.ErrHandlerTimeout
+	}
 	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
 	}
 	if w.head {
 		return len(data), nil
 	}
-	if !w.committed {
+	switch w.state.Load() {
+	case responsePending:
 		return w.body.Write(data)
+	case responseTimedOut, responseStreamingTimedOut:
+		return 0, http.ErrHandlerTimeout
+	}
+	w.streamMu.Lock()
+	defer w.streamMu.Unlock()
+	if w.state.Load() != responseStreaming || w.deadlineExceeded() {
+		return 0, http.ErrHandlerTimeout
 	}
 	n, err := w.dst.Write(data)
-	w.bytesWritten += int64(n)
+	w.bytesWritten.Add(int64(n))
 	return n, err
 }
 
 func (w *observedResponse) Flush() {
 	w.startStreaming()
-	if flusher, ok := w.dst.(http.Flusher); ok {
+	w.streamMu.Lock()
+	defer w.streamMu.Unlock()
+	if flusher, ok := w.dst.(http.Flusher); ok && w.state.Load() == responseStreaming {
 		flusher.Flush()
 	}
 }
 
 func (w *observedResponse) startStreaming() {
-	if w.committed {
+	w.streamMu.Lock()
+	defer w.streamMu.Unlock()
+	if w.deadlineExceeded() {
+		return
+	}
+	if !w.state.CompareAndSwap(responsePending, responseStreaming) {
 		return
 	}
 	if !w.wroteHeader {
-		w.status = http.StatusOK
+		w.status.Store(http.StatusOK)
 		w.wroteHeader = true
 	}
 	copyResponseHeader(w.dst.Header(), w.header)
-	w.dst.WriteHeader(w.status)
-	w.committed = true
+	w.dst.WriteHeader(int(w.status.Load()))
 	if !w.head && w.body.Len() != 0 {
 		n, _ := w.dst.Write(w.body.Bytes())
-		w.bytesWritten += int64(n)
+		w.bytesWritten.Add(int64(n))
 	}
 	w.body.Reset()
 }
 
 func (w *observedResponse) finish() {
-	if w.committed {
+	w.streamMu.Lock()
+	defer w.streamMu.Unlock()
+	if !w.state.CompareAndSwap(responsePending, responseCompleted) {
 		return
 	}
 	if !w.wroteHeader {
-		w.status = http.StatusOK
+		w.status.Store(http.StatusOK)
 		w.wroteHeader = true
 	}
-	if w.header.Get("Content-Length") == "" && responseMayHaveBody(w.status) {
+	status := int(w.status.Load())
+	if w.header.Get("Content-Length") == "" && responseMayHaveBody(status) {
 		w.header.Set("Content-Length", strconv.Itoa(w.body.Len()))
 	}
 	copyResponseHeader(w.dst.Header(), w.header)
-	w.dst.WriteHeader(w.status)
-	w.committed = true
-	if !w.head && responseMayHaveBody(w.status) {
+	w.dst.WriteHeader(status)
+	if !w.head && responseMayHaveBody(status) {
 		n, _ := w.dst.Write(w.body.Bytes())
-		w.bytesWritten += int64(n)
+		w.bytesWritten.Add(int64(n))
 	}
 	w.body.Reset()
 }
@@ -434,9 +548,63 @@ func (w *observedResponse) finish() {
 func (w *observedResponse) reset() {
 	w.header = make(http.Header)
 	w.body.Reset()
-	w.status = 0
+	w.status.Store(0)
 	w.wroteHeader = false
 }
+
+func (w *observedResponse) replaceWithInternalError() {
+	if w.state.Load() != responsePending {
+		return
+	}
+	requestID := w.header.Get("X-Request-ID")
+	w.reset()
+	w.header.Set("X-Request-ID", requestID)
+	writeAPIError(w, http.StatusInternalServerError, errorCodeInternal, "internal server error")
+}
+
+func (w *observedResponse) timeout(requestID string) (streaming bool) {
+	if w.state.CompareAndSwap(responsePending, responseTimedOut) {
+		const body = "{\"error\":{\"code\":503,\"text\":\"request timed out\"}}\n"
+		w.streamMu.Lock()
+		defer w.streamMu.Unlock()
+		header := make(http.Header)
+		header.Set("X-Request-ID", requestID)
+		header.Set("Content-Type", "application/json; charset=utf-8")
+		header.Set("Content-Length", strconv.Itoa(len(body)))
+		copyResponseHeader(w.dst.Header(), header)
+		w.status.Store(http.StatusServiceUnavailable)
+		w.dst.WriteHeader(http.StatusServiceUnavailable)
+		if !w.head {
+			n, _ := w.dst.Write([]byte(body))
+			w.bytesWritten.Add(int64(n))
+		}
+		return false
+	}
+
+	w.streamMu.Lock()
+	defer w.streamMu.Unlock()
+	if w.state.CompareAndSwap(responseStreaming, responseStreamingTimedOut) {
+		return true
+	}
+	return w.state.Load() == responseStreamingTimedOut
+}
+
+func (w *observedResponse) statusCode() int {
+	status := int(w.status.Load())
+	if status == 0 {
+		return http.StatusOK
+	}
+	return status
+}
+
+func (w *observedResponse) responseHeader() http.Header {
+	if state := w.state.Load(); state != responsePending && state != responseCompleted {
+		return w.dst.Header()
+	}
+	return w.header
+}
+
+func (w *observedResponse) writtenBytes() int64 { return w.bytesWritten.Load() }
 
 func copyResponseHeader(dst, src http.Header) {
 	for name := range dst {

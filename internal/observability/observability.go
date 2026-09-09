@@ -32,6 +32,7 @@ type Registry struct {
 	dbErrors   uint64
 	dbSeconds  float64
 	fileBytes  map[string]uint64
+	timeouts   map[timeoutKey]uint64
 }
 
 type requestKey struct {
@@ -43,8 +44,12 @@ type requestValue struct {
 	seconds float64
 }
 
+type timeoutKey struct {
+	route, method, mode string
+}
+
 func NewMetrics() *Registry {
-	return &Registry{requests: make(map[requestKey]*requestValue), fileBytes: make(map[string]uint64)}
+	return &Registry{requests: make(map[requestKey]*requestValue), fileBytes: make(map[string]uint64), timeouts: make(map[timeoutKey]uint64)}
 }
 
 func (m *Registry) ObserveRequest(route, method string, status int, seconds float64) {
@@ -95,6 +100,18 @@ func (m *Registry) ObserveFile(direction string, bytes int64) {
 	m.fileBytes[direction] += uint64(bytes)
 }
 
+// ObserveTimeout distinguishes a contract JSON timeout from an interrupted
+// stream without attaching request IDs or other unbounded labels.
+func (m *Registry) ObserveTimeout(route, method string, streaming bool) {
+	mode := "response"
+	if streaming {
+		mode = "streaming"
+	}
+	m.mu.Lock()
+	m.timeouts[timeoutKey{route: route, method: method, mode: mode}]++
+	m.mu.Unlock()
+}
+
 func (m *Registry) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	m.mu.Lock()
 	keys := make([]requestKey, 0, len(m.requests))
@@ -121,6 +138,23 @@ func (m *Registry) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 		if k.status >= 500 {
 			fmt.Fprintf(&b, "documents_http_errors_total{%s} %d\n", labels, v.count)
 		}
+	}
+	timeoutKeys := make([]timeoutKey, 0, len(m.timeouts))
+	for k := range m.timeouts {
+		timeoutKeys = append(timeoutKeys, k)
+	}
+	sort.Slice(timeoutKeys, func(i, j int) bool {
+		a, b := timeoutKeys[i], timeoutKeys[j]
+		if a.route != b.route {
+			return a.route < b.route
+		}
+		if a.method != b.method {
+			return a.method < b.method
+		}
+		return a.mode < b.mode
+	})
+	for _, k := range timeoutKeys {
+		fmt.Fprintf(&b, "documents_http_timeouts_total{route=%q,method=%q,mode=%q} %d\n", k.route, k.method, k.mode, m.timeouts[k])
 	}
 	fmt.Fprintf(&b, "documents_cache_requests_total{result=\"miss\"} %d\ndocuments_cache_requests_total{result=\"hit\"} %d\n", m.cacheHits[0], m.cacheHits[1])
 	fmt.Fprintf(&b, "documents_cache_size_bytes %d\ndocuments_cache_items %d\n", m.cacheBytes, m.cacheItems)

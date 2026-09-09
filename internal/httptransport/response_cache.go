@@ -73,9 +73,9 @@ func (h *handler) cachedResponse(ctx context.Context, key string, tags []string,
 func (h *handler) observeCache(ctx context.Context, hit bool) {
 	if state, ok := ctx.Value(observationKey).(*requestObservation); ok {
 		if hit {
-			state.cache = "hit"
+			state.setCache("hit")
 		} else {
-			state.cache = "miss"
+			state.setCache("miss")
 		}
 	}
 	if h.deps.Metrics != nil {

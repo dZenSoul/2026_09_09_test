@@ -17,6 +17,7 @@ const (
 	errorCodeMethodNotAllowed = 405
 	errorCodeInternal         = 500
 	errorCodeNotImplemented   = 501
+	errorCodeTimeout          = 503
 )
 
 type errorPayload struct {

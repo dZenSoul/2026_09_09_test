@@ -71,7 +71,53 @@ func TestProcessingTimeoutStopsARequest(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	started := time.Now()
 	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/health/ready", nil))
-	if recorder.Code != http.StatusServiceUnavailable || time.Since(started) > time.Second {
+	want := "{\"error\":{\"code\":503,\"text\":\"request timed out\"}}\n"
+	if recorder.Code != http.StatusServiceUnavailable || recorder.Body.String() != want ||
+		recorder.Header().Get("Content-Type") != "application/json; charset=utf-8" ||
+		recorder.Header().Get("Content-Length") != "50" || recorder.Header().Get("X-Request-ID") == "" ||
+		time.Since(started) > time.Second {
 		t.Fatalf("timeout response: status=%d duration=%s", recorder.Code, time.Since(started))
+	}
+}
+
+func TestProcessingTimeoutHEADHasRepresentationHeadersAndNoBody(t *testing.T) {
+	h := NewHandler(Dependencies{}).(*handler)
+	request := httptest.NewRequest(http.MethodHead, "/api/docs", nil)
+	ctx, cancel := context.WithTimeout(request.Context(), 10*time.Millisecond)
+	request = request.WithContext(ctx)
+	recorder := httptest.NewRecorder()
+	h.serveHTTP(recorder, request, http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}), cancel)
+
+	if recorder.Code != http.StatusServiceUnavailable || recorder.Body.Len() != 0 ||
+		recorder.Header().Get("Content-Type") != "application/json; charset=utf-8" ||
+		recorder.Header().Get("Content-Length") != "50" {
+		t.Fatalf("HEAD timeout: status=%d headers=%v body=%q", recorder.Code, recorder.Header(), recorder.Body)
+	}
+}
+
+func TestStreamingTimeoutDoesNotAppendJSONAndRejectsLaterWrites(t *testing.T) {
+	h := NewHandler(Dependencies{}).(*handler)
+	request := httptest.NewRequest(http.MethodGet, "/api/docs/id", nil)
+	ctx, cancel := context.WithTimeout(request.Context(), 10*time.Millisecond)
+	request = request.WithContext(ctx)
+	recorder := httptest.NewRecorder()
+	lateWrite := make(chan error, 1)
+	h.serveHTTP(recorder, request, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		beginStreaming(w)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("partial"))
+		<-r.Context().Done()
+		_, err := w.Write([]byte("late"))
+		lateWrite <- err
+	}), cancel)
+
+	if err := <-lateWrite; !errors.Is(err, http.ErrHandlerTimeout) {
+		t.Fatalf("late write error=%v", err)
+	}
+	if recorder.Code != http.StatusOK || recorder.Body.String() != "partial" || strings.Contains(recorder.Body.String(), "request timed out") {
+		t.Fatalf("streaming timeout: status=%d body=%q", recorder.Code, recorder.Body)
 	}
 }
