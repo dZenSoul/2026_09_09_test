@@ -157,7 +157,7 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if r.Method == http.MethodDelete {
-			h.operation(w, r, http.MethodDelete)
+			h.deleteDocument(w, r, strings.TrimPrefix(path, "/api/docs/"))
 			return
 		}
 		methodNotAllowed(w, http.MethodDelete, http.MethodGet, http.MethodHead)

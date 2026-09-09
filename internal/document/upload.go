@@ -139,10 +139,6 @@ func (s *service) Upload(ctx context.Context, requester domain.User, input Uploa
 	return domain.Document{}, mapRepositoryError(err)
 }
 
-func (s *service) Delete(context.Context, domain.User, string) error {
-	return domain.ErrNotImplemented
-}
-
 func validName(name string) bool {
 	if strings.TrimSpace(name) == "" || name == "." || name == ".." || strings.Contains(name, "..") || filepath.Base(name) != name || strings.ContainsAny(name, `/\\`) {
 		return false
