@@ -61,6 +61,7 @@ func run() error {
 	documentService, err := document.NewService(store.Documents(), store.Users(), blobStorage, document.Config{
 		MaxFileBytes:  cfg.MaxFileBytes,
 		MaxGrantItems: cfg.MaxGrantItems,
+		MaxListLimit:  cfg.MaxListLimit,
 	})
 	if err != nil {
 		return err

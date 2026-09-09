@@ -29,6 +29,7 @@ func TestBuildDocumentFilterWhitelistAndTypes(t *testing.T) {
 		{name: "invalid uuid", key: "id", value: "not-an-id", wantErr: true},
 		{name: "invalid bool", key: "public", value: "1", wantErr: true},
 		{name: "invalid time", key: "created", value: "tomorrow", wantErr: true},
+		{name: "missing value", key: "name", wantErr: true},
 		{name: "value without key", value: "x", wantErr: true},
 	}
 	for _, tt := range tests {

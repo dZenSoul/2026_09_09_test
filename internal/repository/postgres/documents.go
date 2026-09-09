@@ -217,6 +217,9 @@ func (s *Store) Delete(ctx context.Context, id, ownerID string) (domain.Document
 }
 
 func buildDocumentFilter(key, raw string) (string, any, error) {
+	if key != "" && raw == "" {
+		return "", nil, fmt.Errorf("document filter: %w", repository.ErrInvalidArgument)
+	}
 	switch key {
 	case "":
 		if raw != "" {

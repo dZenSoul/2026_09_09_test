@@ -21,6 +21,7 @@ const (
 	defaultMaxFileBytes  int64 = 25 << 20
 	defaultMaxJSONBytes  int64 = 1 << 20
 	defaultMaxGrantItems       = 100
+	defaultMaxListLimit        = 100
 )
 
 // Limits contains transport-level and handler-level input limits. Only the
@@ -73,6 +74,9 @@ func NewHandler(deps Dependencies) http.Handler {
 	}
 	if deps.Limits.MaxGrantItems <= 0 {
 		deps.Limits.MaxGrantItems = defaultMaxGrantItems
+	}
+	if deps.Limits.MaxListLimit <= 0 {
+		deps.Limits.MaxListLimit = defaultMaxListLimit
 	}
 	return &handler{deps: deps}
 }
@@ -140,6 +144,10 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request) {
 	case path == "/api/docs":
 		if r.Method == http.MethodPost {
 			h.uploadDocument(w, r)
+			return
+		}
+		if r.Method == http.MethodGet || r.Method == http.MethodHead {
+			h.listDocuments(w, r)
 			return
 		}
 		h.operation(w, r, http.MethodGet, http.MethodHead, http.MethodPost)

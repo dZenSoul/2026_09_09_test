@@ -25,6 +25,7 @@ const storageKeyBytes = 32
 type Config struct {
 	MaxFileBytes  int64
 	MaxGrantItems int
+	MaxListLimit  int
 	Rand          io.Reader
 }
 
@@ -34,6 +35,7 @@ type service struct {
 	blobs     blob.Storage
 	maxFile   int64
 	maxGrants int
+	maxList   int
 	rand      io.Reader
 }
 
@@ -45,9 +47,13 @@ func NewService(documents repository.DocumentRepository, users repository.UserRe
 	if random == nil {
 		random = rand.Reader
 	}
+	maxList := cfg.MaxListLimit
+	if maxList <= 0 {
+		maxList = 100
+	}
 	return &service{
 		documents: documents, users: users, blobs: blobs,
-		maxFile: cfg.MaxFileBytes, maxGrants: cfg.MaxGrantItems, rand: random,
+		maxFile: cfg.MaxFileBytes, maxGrants: cfg.MaxGrantItems, maxList: maxList, rand: random,
 	}, nil
 }
 
@@ -131,10 +137,6 @@ func (s *service) Upload(ctx context.Context, requester domain.User, input Uploa
 		}
 	}
 	return domain.Document{}, mapRepositoryError(err)
-}
-
-func (s *service) List(context.Context, domain.User, domain.DocumentFilter) ([]domain.Document, error) {
-	return nil, domain.ErrNotImplemented
 }
 
 func (s *service) Get(context.Context, domain.User, string) (Content, error) {
