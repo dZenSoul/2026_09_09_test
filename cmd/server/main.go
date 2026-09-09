@@ -42,7 +42,16 @@ func run() error {
 		return err
 	}
 
-	handler := httptransport.NewHandler(httptransport.Dependencies{Logger: logger})
+	handler := httptransport.NewHandler(httptransport.Dependencies{
+		Logger: logger,
+		Limits: httptransport.Limits{
+			MaxRequestBytes: cfg.MaxRequestBytes,
+			MaxFileBytes:    cfg.MaxFileBytes,
+			MaxJSONBytes:    cfg.MaxJSONBytes,
+			MaxGrantItems:   cfg.MaxGrantItems,
+			MaxListLimit:    cfg.MaxListLimit,
+		},
+	})
 	server := &http.Server{
 		Addr:              cfg.HTTPAddress(),
 		Handler:           http.TimeoutHandler(handler, cfg.HTTPProcessingTimeout, "request timed out"),
