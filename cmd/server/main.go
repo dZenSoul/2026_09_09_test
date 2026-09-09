@@ -10,7 +10,9 @@ import (
 	"syscall"
 
 	"documents/internal/auth"
+	"documents/internal/blob"
 	"documents/internal/config"
+	"documents/internal/document"
 	"documents/internal/httptransport"
 	"documents/internal/observability"
 	postgresrepository "documents/internal/repository/postgres"
@@ -49,10 +51,25 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	if cfg.StorageDriver != config.StorageFilesystem {
+		return errors.New("configured blob storage driver is not implemented")
+	}
+	blobStorage, err := blob.NewFileStorage(cfg.FileStorage.Root)
+	if err != nil {
+		return err
+	}
+	documentService, err := document.NewService(store.Documents(), store.Users(), blobStorage, document.Config{
+		MaxFileBytes:  cfg.MaxFileBytes,
+		MaxGrantItems: cfg.MaxGrantItems,
+	})
+	if err != nil {
+		return err
+	}
 
 	handler := httptransport.NewHandler(httptransport.Dependencies{
-		Auth:   authService,
-		Logger: logger,
+		Auth:      authService,
+		Documents: documentService,
+		Logger:    logger,
 		Limits: httptransport.Limits{
 			MaxRequestBytes: cfg.MaxRequestBytes,
 			MaxFileBytes:    cfg.MaxFileBytes,

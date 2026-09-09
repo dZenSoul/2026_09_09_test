@@ -17,6 +17,12 @@ import (
 
 const defaultMaxRequestBytes int64 = 32 << 20
 
+const (
+	defaultMaxFileBytes  int64 = 25 << 20
+	defaultMaxJSONBytes  int64 = 1 << 20
+	defaultMaxGrantItems       = 100
+)
+
 // Limits contains transport-level and handler-level input limits. Only the
 // overall request limit is enforced here; narrower limits are available to the
 // operation handlers so files and JSON can be checked independently.
@@ -58,6 +64,15 @@ func NewHandler(deps Dependencies) http.Handler {
 	}
 	if deps.Limits.MaxRequestBytes <= 0 {
 		deps.Limits.MaxRequestBytes = defaultMaxRequestBytes
+	}
+	if deps.Limits.MaxFileBytes <= 0 {
+		deps.Limits.MaxFileBytes = defaultMaxFileBytes
+	}
+	if deps.Limits.MaxJSONBytes <= 0 {
+		deps.Limits.MaxJSONBytes = defaultMaxJSONBytes
+	}
+	if deps.Limits.MaxGrantItems <= 0 {
+		deps.Limits.MaxGrantItems = defaultMaxGrantItems
 	}
 	return &handler{deps: deps}
 }
@@ -123,6 +138,10 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request) {
 		}
 		h.logout(w, r, strings.TrimPrefix(path, "/api/auth/"))
 	case path == "/api/docs":
+		if r.Method == http.MethodPost {
+			h.uploadDocument(w, r)
+			return
+		}
 		h.operation(w, r, http.MethodGet, http.MethodHead, http.MethodPost)
 	case singlePathValue(path, "/api/docs/"):
 		h.operation(w, r, http.MethodDelete, http.MethodGet, http.MethodHead)
