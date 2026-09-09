@@ -12,6 +12,7 @@ import (
 	"documents/internal/config"
 	"documents/internal/httptransport"
 	"documents/internal/observability"
+	postgresrepository "documents/internal/repository/postgres"
 )
 
 func main() {
@@ -29,6 +30,17 @@ func run() error {
 
 	logger := observability.NewLogger(os.Stdout, cfg.LogLevel)
 	slog.SetDefault(logger)
+
+	databaseCtx, cancelDatabase := context.WithTimeout(context.Background(), cfg.HTTPProcessingTimeout)
+	defer cancelDatabase()
+	store, err := postgresrepository.Open(databaseCtx, postgresrepository.Config{DSN: cfg.PostgresDSN})
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	if err := store.MigrateUp(databaseCtx); err != nil {
+		return err
+	}
 
 	handler := httptransport.NewHandler(httptransport.Dependencies{Logger: logger})
 	server := &http.Server{

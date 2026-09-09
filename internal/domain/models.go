@@ -33,6 +33,7 @@ type Document struct {
 	SizeBytes  int64
 	CreatedAt  time.Time
 	UpdatedAt  time.Time
+	Version    int64
 	Grants     []string
 }
 

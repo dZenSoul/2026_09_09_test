@@ -4,9 +4,20 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"documents/internal/domain"
+)
+
+// Stable repository errors keep driver and SQL details inside the persistence
+// layer. Callers should inspect them with errors.Is.
+var (
+	ErrNotFound        = errors.New("repository: not found")
+	ErrConflict        = errors.New("repository: conflict")
+	ErrForbidden       = errors.New("repository: forbidden")
+	ErrInvalidArgument = errors.New("repository: invalid argument")
+	ErrInternal        = errors.New("repository: internal error")
 )
 
 type UserRepository interface {
@@ -24,6 +35,7 @@ type SessionRepository interface {
 type DocumentRepository interface {
 	Create(ctx context.Context, document domain.Document) (domain.Document, error)
 	ByID(ctx context.Context, id string) (domain.Document, error)
+	ByIDAccessible(ctx context.Context, id, requesterID string) (domain.Document, error)
 	List(ctx context.Context, requesterID string, filter domain.DocumentFilter) ([]domain.Document, error)
 	Delete(ctx context.Context, id, ownerID string) (domain.Document, error)
 }
