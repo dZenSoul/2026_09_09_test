@@ -33,11 +33,17 @@ func run() error {
 	}
 
 	logger := observability.NewLogger(os.Stdout, cfg.LogLevel)
+	metrics := observability.NewMetrics()
 	slog.SetDefault(logger)
 
 	databaseCtx, cancelDatabase := context.WithTimeout(context.Background(), cfg.HTTPProcessingTimeout)
 	defer cancelDatabase()
-	store, err := postgresrepository.Open(databaseCtx, postgresrepository.Config{DSN: cfg.PostgresDSN})
+	store, err := postgresrepository.Open(databaseCtx, postgresrepository.Config{
+		DSN:      cfg.PostgresDSN,
+		MaxConns: int32(cfg.PostgresMaxConns), MinConns: int32(cfg.PostgresMinConns),
+		MaxConnLifetime: cfg.PostgresMaxConnLifetime, MaxConnIdleTime: cfg.PostgresMaxConnIdleTime,
+		HealthCheckPeriod: cfg.PostgresHealthCheckPeriod, ObserveQuery: metrics.ObserveDatabase,
+	})
 	if err != nil {
 		return err
 	}
@@ -59,6 +65,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	defer blobStorage.Close()
 	documentService, err := document.NewService(store.Documents(), store.Users(), blobStorage, document.Config{
 		MaxFileBytes:  cfg.MaxFileBytes,
 		MaxGrantItems: cfg.MaxGrantItems,
@@ -68,13 +75,23 @@ func run() error {
 		return err
 	}
 
+	cache := responsecache.NewMemory(cfg.CacheMaxBytes, cfg.CacheMaxItems)
+	defer cache.Close()
 	handler := httptransport.NewHandler(httptransport.Dependencies{
 		Auth:              authService,
 		Documents:         documentService,
-		Cache:             responsecache.NewMemory(cfg.CacheMaxBytes, cfg.CacheMaxItems),
+		Cache:             cache,
 		CacheTTL:          cfg.CacheTTL,
 		ExposeCacheHeader: cfg.ExposeCacheHeader,
 		Logger:            logger,
+		Metrics:           metrics,
+		Readiness: func(ctx context.Context) error {
+			if err := store.Ping(ctx); err != nil {
+				return err
+			}
+			return blobStorage.Ping(ctx)
+		},
+		ProcessingTimeout: cfg.HTTPProcessingTimeout,
 		Limits: httptransport.Limits{
 			MaxRequestBytes: cfg.MaxRequestBytes,
 			MaxFileBytes:    cfg.MaxFileBytes,
@@ -83,12 +100,16 @@ func run() error {
 			MaxListLimit:    cfg.MaxListLimit,
 		},
 	})
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", metrics)
+	mux.Handle("/", handler)
 	server := &http.Server{
 		Addr:              cfg.HTTPAddress(),
-		Handler:           http.TimeoutHandler(handler, cfg.HTTPProcessingTimeout, "request timed out"),
+		Handler:           mux,
 		ReadTimeout:       cfg.HTTPReadTimeout,
 		ReadHeaderTimeout: cfg.HTTPReadTimeout,
 		WriteTimeout:      cfg.HTTPWriteTimeout,
+		IdleTimeout:       cfg.HTTPIdleTimeout,
 	}
 
 	serveErr := make(chan error, 1)
@@ -110,6 +131,10 @@ func run() error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.GracefulShutdownTimeout)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
+			closeErr := server.Close()
+			if closeErr != nil {
+				return errors.Join(err, closeErr)
+			}
 			return err
 		}
 		return nil

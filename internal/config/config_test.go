@@ -41,6 +41,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.ExposeCacheHeader {
 		t.Error("diagnostic cache header must be disabled by default")
 	}
+	if cfg.HTTPIdleTimeout != time.Minute || cfg.PostgresMaxConns != 10 || cfg.PostgresMinConns != 1 {
+		t.Errorf("unexpected runtime defaults: %#v", cfg)
+	}
 }
 
 func TestLoadOverrides(t *testing.T) {
@@ -53,6 +56,8 @@ func TestLoadOverrides(t *testing.T) {
 		"MAX_GRANT_ITEMS": "5", "MAX_LIST_LIMIT": "25",
 		"HTTP_READ_TIMEOUT": "3s", "HTTP_WRITE_TIMEOUT": "9s",
 		"HTTP_PROCESSING_TIMEOUT": "8s", "GRACEFUL_SHUTDOWN_TIMEOUT": "4s",
+		"HTTP_IDLE_TIMEOUT": "20s", "POSTGRES_MAX_CONNS": "20", "POSTGRES_MIN_CONNS": "2",
+		"POSTGRES_MAX_CONN_LIFETIME": "2h", "POSTGRES_MAX_CONN_IDLE_TIME": "10m", "POSTGRES_HEALTH_CHECK_PERIOD": "30s",
 		"LOG_LEVEL": "debug", "EXPOSE_CACHE_HEADER": "true",
 	}
 	for key, value := range overrides {
@@ -71,6 +76,9 @@ func TestLoadOverrides(t *testing.T) {
 	}
 	if cfg.LogLevel != "debug" || !cfg.ExposeCacheHeader {
 		t.Errorf("observability overrides were not applied: %#v", cfg)
+	}
+	if cfg.HTTPIdleTimeout != 20*time.Second || cfg.PostgresMaxConns != 20 || cfg.PostgresMinConns != 2 {
+		t.Errorf("runtime overrides were not applied: %#v", cfg)
 	}
 }
 

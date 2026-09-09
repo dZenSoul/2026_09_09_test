@@ -116,6 +116,9 @@ func writeDocumentContent(w http.ResponseWriter, content document.Content) error
 
 func writeFileHeaders(w http.ResponseWriter, metadata domain.Document) {
 	w.Header().Set("Content-Type", metadata.MIME)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	// Uploaded active content is returned as data, never trusted as application UI.
+	w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'")
 	w.Header().Set("Content-Length", strconv.FormatInt(metadata.SizeBytes, 10))
 	// FormatMediaType quotes and escapes ASCII special characters and emits an
 	// RFC 5987 filename parameter for names that cannot safely fit in a header.

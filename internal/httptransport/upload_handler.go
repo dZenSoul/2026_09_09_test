@@ -96,9 +96,13 @@ func (h *handler) uploadDocument(w http.ResponseWriter, r *http.Request) {
 		writeDomainError(w, err)
 		return
 	}
+	if filePresent && h.deps.Metrics != nil {
+		h.deps.Metrics.ObserveFile("upload", fileSize)
+	}
 	if h.deps.Cache != nil {
 		h.cacheEpoch.Add(1)
 		h.deps.Cache.Invalidate(context.WithoutCancel(r.Context()), listCacheTag)
+		h.observeCacheSize()
 	}
 
 	data := make(map[string]any, 2)

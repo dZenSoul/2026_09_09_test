@@ -38,6 +38,7 @@ func (h *handler) deleteDocument(w http.ResponseWriter, r *http.Request, id stri
 	if h.deps.Cache != nil {
 		h.cacheEpoch.Add(1)
 		h.deps.Cache.Invalidate(context.WithoutCancel(r.Context()), listCacheTag, "document:"+id)
+		h.observeCacheSize()
 	}
 	writeResponse(w, http.StatusOK, map[string]bool{id: true})
 }

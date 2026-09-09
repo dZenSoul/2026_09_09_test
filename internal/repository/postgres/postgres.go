@@ -30,6 +30,7 @@ type Config struct {
 	MaxConnLifetime   time.Duration
 	MaxConnIdleTime   time.Duration
 	HealthCheckPeriod time.Duration
+	ObserveQuery      func(time.Duration, error)
 }
 
 // Store owns the pool and implements all repository interfaces.
@@ -55,6 +56,9 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	poolConfig.MaxConnIdleTime = cfg.MaxConnIdleTime
 	poolConfig.HealthCheckPeriod = cfg.HealthCheckPeriod
 	poolConfig.ConnConfig.RuntimeParams["timezone"] = "UTC"
+	if cfg.ObserveQuery != nil {
+		poolConfig.ConnConfig.Tracer = queryTracer{observe: cfg.ObserveQuery}
+	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
@@ -93,6 +97,32 @@ func New(pool *pgxpool.Pool) *Store {
 func (s *Store) Close() {
 	if s != nil && s.pool != nil {
 		s.pool.Close()
+	}
+}
+
+// Ping checks the dependency used by readiness probes.
+func (s *Store) Ping(ctx context.Context) error {
+	if s == nil || s.pool == nil {
+		return repository.ErrInternal
+	}
+	if err := s.pool.Ping(ctx); err != nil {
+		return repository.ErrInternal
+	}
+	return nil
+}
+
+type queryTraceKey struct{}
+
+type queryTracer struct{ observe func(time.Duration, error) }
+
+func (t queryTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, _ pgx.TraceQueryStartData) context.Context {
+	return context.WithValue(ctx, queryTraceKey{}, time.Now())
+}
+
+func (t queryTracer) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryEndData) {
+	started, _ := ctx.Value(queryTraceKey{}).(time.Time)
+	if !started.IsZero() {
+		t.observe(time.Since(started), data.Err)
 	}
 }
 

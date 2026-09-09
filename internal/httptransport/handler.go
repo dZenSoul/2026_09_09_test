@@ -46,6 +46,16 @@ type Dependencies struct {
 	CacheTTL          time.Duration
 	ExposeCacheHeader bool
 	Logger            *slog.Logger
+	Metrics           interface {
+		ObserveRequest(route, method string, status int, seconds float64)
+		ObserveCache(hit bool)
+		SetCacheSize(bytes int64, items int)
+		ObserveFile(direction string, bytes int64)
+	}
+	Readiness func(context.Context) error
+	// ProcessingTimeout bounds complete handler execution independently of
+	// socket read/write deadlines. Zero leaves it to an outer server in tests.
+	ProcessingTimeout time.Duration
 	Limits            Limits
 }
 
@@ -58,6 +68,10 @@ type handler struct {
 type contextKey uint8
 
 const requestIDKey contextKey = iota
+
+type requestObservation struct{ cache string }
+
+const observationKey contextKey = requestIDKey + 1
 
 // RequestID returns the server-generated request identifier associated with
 // ctx. It returns an empty string outside an HTTP request.
@@ -94,23 +108,48 @@ func NewHandler(deps Dependencies) http.Handler {
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h.serveHTTP(w, r, http.HandlerFunc(h.route))
+	var next http.Handler = http.HandlerFunc(h.route)
+	if h.deps.ProcessingTimeout > 0 {
+		next = http.TimeoutHandler(next, h.deps.ProcessingTimeout, "request timed out")
+	}
+	h.serveHTTP(w, r, next)
 }
 
 func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request, next http.Handler) {
+	started := time.Now()
 	requestID := uuid.NewString()
 	w.Header().Set("X-Request-ID", requestID)
-	r = r.WithContext(context.WithValue(r.Context(), requestIDKey, requestID))
+	observation := &requestObservation{cache: "none"}
+	ctx := context.WithValue(r.Context(), requestIDKey, requestID)
+	r = r.WithContext(context.WithValue(ctx, observationKey, observation))
 
 	buffer := newBufferedResponse()
 	defer func() {
-		if recover() != nil {
+		if recovered := recover(); recovered != nil {
 			h.deps.Logger.Error("HTTP handler panic recovered",
 				"request_id", requestID,
+				"route", normalizedRoute(r.URL.Path),
 				"method", r.Method,
 			)
 			buffer = newBufferedResponse()
 			writeAPIError(buffer, http.StatusInternalServerError, errorCodeInternal, "internal server error")
+		}
+		status := buffer.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		duration := time.Since(started)
+		log := h.deps.Logger.Info
+		if status >= 500 {
+			log = h.deps.Logger.Error
+		}
+		log("HTTP request completed", "request_id", requestID, "route", normalizedRoute(r.URL.Path),
+			"method", r.Method, "status", status, "duration_ms", duration.Milliseconds(), "cache", observation.cache)
+		if h.deps.Metrics != nil {
+			h.deps.Metrics.ObserveRequest(normalizedRoute(r.URL.Path), r.Method, status, duration.Seconds())
+			if disposition := buffer.header.Get("Content-Disposition"); r.Method != http.MethodHead && disposition != "" {
+				h.deps.Metrics.ObserveFile("download", int64(buffer.body.Len()))
+			}
 		}
 		buffer.commit(w, r.Method == http.MethodHead)
 	}()
@@ -133,6 +172,18 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			methodNotAllowed(w, http.MethodGet)
 			return
+		}
+		writeResponse(w, http.StatusOK, map[string]string{"status": "ok"})
+	case path == "/health/ready":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return
+		}
+		if h.deps.Readiness != nil {
+			if err := h.deps.Readiness(r.Context()); err != nil {
+				writeAPIError(w, http.StatusServiceUnavailable, errorCodeInternal, "service unavailable")
+				return
+			}
 		}
 		writeResponse(w, http.StatusOK, map[string]string{"status": "ok"})
 	case path == "/api/register":
@@ -175,6 +226,21 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w, http.MethodDelete, http.MethodGet, http.MethodHead)
 	default:
 		writeAPIError(w, http.StatusNotFound, errorCodeNotFound, "resource not found")
+	}
+}
+
+// normalizedRoute deliberately never returns path parameters: session tokens
+// and document IDs therefore cannot enter logs or metric labels.
+func normalizedRoute(path string) string {
+	switch {
+	case path == "/health/live", path == "/health/ready", path == "/metrics", path == "/api/register", path == "/api/auth", path == "/api/docs":
+		return path
+	case singlePathValue(path, "/api/auth/"):
+		return "/api/auth/{token}"
+	case singlePathValue(path, "/api/docs/"):
+		return "/api/docs/{id}"
+	default:
+		return "not_found"
 	}
 }
 

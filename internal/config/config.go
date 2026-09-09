@@ -44,8 +44,15 @@ type Config struct {
 
 	HTTPReadTimeout         time.Duration
 	HTTPWriteTimeout        time.Duration
+	HTTPIdleTimeout         time.Duration
 	HTTPProcessingTimeout   time.Duration
 	GracefulShutdownTimeout time.Duration
+
+	PostgresMaxConns          int
+	PostgresMinConns          int
+	PostgresMaxConnLifetime   time.Duration
+	PostgresMaxConnIdleTime   time.Duration
+	PostgresHealthCheckPeriod time.Duration
 
 	LogLevel          string
 	ExposeCacheHeader bool
@@ -78,25 +85,31 @@ func Load() (Config, error) {
 // process environment. The lookup function has the same contract as os.LookupEnv.
 func LoadFromLookup(lookup func(string) (string, bool)) (Config, error) {
 	c := Config{
-		HTTPHost:                "0.0.0.0",
-		HTTPPort:                8080,
-		StorageDriver:           StorageFilesystem,
-		FileStorage:             FileStorageConfig{Root: "./data/blobs"},
-		S3Storage:               S3StorageConfig{Region: "us-east-1", UseTLS: true},
-		SessionTTL:              24 * time.Hour,
-		CacheTTL:                5 * time.Minute,
-		CacheMaxBytes:           64 << 20,
-		CacheMaxItems:           1000,
-		MaxRequestBytes:         32 << 20,
-		MaxFileBytes:            25 << 20,
-		MaxJSONBytes:            1 << 20,
-		MaxGrantItems:           100,
-		MaxListLimit:            100,
-		HTTPReadTimeout:         10 * time.Second,
-		HTTPWriteTimeout:        30 * time.Second,
-		HTTPProcessingTimeout:   30 * time.Second,
-		GracefulShutdownTimeout: 10 * time.Second,
-		LogLevel:                "info",
+		HTTPHost:                  "0.0.0.0",
+		HTTPPort:                  8080,
+		StorageDriver:             StorageFilesystem,
+		FileStorage:               FileStorageConfig{Root: "./data/blobs"},
+		S3Storage:                 S3StorageConfig{Region: "us-east-1", UseTLS: true},
+		SessionTTL:                24 * time.Hour,
+		CacheTTL:                  5 * time.Minute,
+		CacheMaxBytes:             64 << 20,
+		CacheMaxItems:             1000,
+		MaxRequestBytes:           32 << 20,
+		MaxFileBytes:              25 << 20,
+		MaxJSONBytes:              1 << 20,
+		MaxGrantItems:             100,
+		MaxListLimit:              100,
+		HTTPReadTimeout:           10 * time.Second,
+		HTTPWriteTimeout:          30 * time.Second,
+		HTTPIdleTimeout:           60 * time.Second,
+		HTTPProcessingTimeout:     30 * time.Second,
+		GracefulShutdownTimeout:   10 * time.Second,
+		PostgresMaxConns:          10,
+		PostgresMinConns:          1,
+		PostgresMaxConnLifetime:   time.Hour,
+		PostgresMaxConnIdleTime:   30 * time.Minute,
+		PostgresHealthCheckPeriod: time.Minute,
+		LogLevel:                  "info",
 	}
 
 	var problems []error
@@ -123,8 +136,12 @@ func LoadFromLookup(lookup func(string) (string, bool)) (Config, error) {
 		{"CACHE_TTL", &c.CacheTTL},
 		{"HTTP_READ_TIMEOUT", &c.HTTPReadTimeout},
 		{"HTTP_WRITE_TIMEOUT", &c.HTTPWriteTimeout},
+		{"HTTP_IDLE_TIMEOUT", &c.HTTPIdleTimeout},
 		{"HTTP_PROCESSING_TIMEOUT", &c.HTTPProcessingTimeout},
 		{"GRACEFUL_SHUTDOWN_TIMEOUT", &c.GracefulShutdownTimeout},
+		{"POSTGRES_MAX_CONN_LIFETIME", &c.PostgresMaxConnLifetime},
+		{"POSTGRES_MAX_CONN_IDLE_TIME", &c.PostgresMaxConnIdleTime},
+		{"POSTGRES_HEALTH_CHECK_PERIOD", &c.PostgresHealthCheckPeriod},
 	} {
 		problems = appendParse(problems, parseDuration(lookup, item.name, item.dst))
 	}
@@ -146,6 +163,8 @@ func LoadFromLookup(lookup func(string) (string, bool)) (Config, error) {
 		dst  *int
 	}{
 		{"CACHE_MAX_ITEMS", &c.CacheMaxItems},
+		{"POSTGRES_MAX_CONNS", &c.PostgresMaxConns},
+		{"POSTGRES_MIN_CONNS", &c.PostgresMinConns},
 		{"MAX_GRANT_ITEMS", &c.MaxGrantItems},
 		{"MAX_LIST_LIMIT", &c.MaxListLimit},
 	} {
@@ -204,7 +223,11 @@ func (c Config) validate() []error {
 	}{
 		{"SESSION_TTL", c.SessionTTL}, {"CACHE_TTL", c.CacheTTL},
 		{"HTTP_READ_TIMEOUT", c.HTTPReadTimeout}, {"HTTP_WRITE_TIMEOUT", c.HTTPWriteTimeout},
+		{"HTTP_IDLE_TIMEOUT", c.HTTPIdleTimeout},
 		{"HTTP_PROCESSING_TIMEOUT", c.HTTPProcessingTimeout}, {"GRACEFUL_SHUTDOWN_TIMEOUT", c.GracefulShutdownTimeout},
+		{"POSTGRES_MAX_CONN_LIFETIME", c.PostgresMaxConnLifetime},
+		{"POSTGRES_MAX_CONN_IDLE_TIME", c.PostgresMaxConnIdleTime},
+		{"POSTGRES_HEALTH_CHECK_PERIOD", c.PostgresHealthCheckPeriod},
 	}
 	for _, item := range positiveDurations {
 		if item.value <= 0 {
@@ -219,6 +242,16 @@ func (c Config) validate() []error {
 		{"MAX_REQUEST_BYTES", c.MaxRequestBytes}, {"MAX_FILE_BYTES", c.MaxFileBytes},
 		{"MAX_JSON_BYTES", c.MaxJSONBytes}, {"MAX_GRANT_ITEMS", int64(c.MaxGrantItems)},
 		{"MAX_LIST_LIMIT", int64(c.MaxListLimit)},
+		{"POSTGRES_MAX_CONNS", int64(c.PostgresMaxConns)},
+	}
+	if c.PostgresMinConns < 0 {
+		problems = append(problems, errors.New("POSTGRES_MIN_CONNS must not be negative"))
+	}
+	if c.PostgresMinConns > c.PostgresMaxConns {
+		problems = append(problems, errors.New("POSTGRES_MIN_CONNS must not exceed POSTGRES_MAX_CONNS"))
+	}
+	if int64(c.PostgresMaxConns) > int64(1<<31-1) {
+		problems = append(problems, errors.New("POSTGRES_MAX_CONNS is too large"))
 	}
 	for _, item := range positiveValues {
 		if item.value <= 0 {

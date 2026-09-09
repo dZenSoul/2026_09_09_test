@@ -125,6 +125,23 @@ func (c *Memory) Invalidate(ctx context.Context, tags ...string) {
 	}
 }
 
+// Stats returns the current bounded cache footprint.
+func (c *Memory) Stats() (bytes int64, items int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.bytes, c.lru.Len()
+}
+
+// Close releases all cache-held response bodies. It is safe to call more than once.
+func (c *Memory) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.items = make(map[string]*list.Element)
+	c.lru.Init()
+	c.bytes = 0
+	return nil
+}
+
 func (c *Memory) remove(element *list.Element) {
 	if element == nil {
 		return

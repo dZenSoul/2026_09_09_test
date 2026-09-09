@@ -17,6 +17,21 @@ type FileStorage struct {
 	root string
 }
 
+// Ping verifies that the mandatory filesystem dependency remains available.
+func (s *FileStorage) Ping(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	info, err := os.Stat(s.root)
+	if err != nil || !info.IsDir() {
+		return errors.New("blob storage unavailable")
+	}
+	return nil
+}
+
+// Close exists to give all storage drivers a uniform lifecycle.
+func (s *FileStorage) Close() error { return nil }
+
 func NewFileStorage(root string) (*FileStorage, error) {
 	if strings.TrimSpace(root) == "" {
 		return nil, fmt.Errorf("configure filesystem blob storage: %w", ErrInvalidKey)

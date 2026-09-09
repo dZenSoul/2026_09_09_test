@@ -12,6 +12,7 @@ const listCacheTag = "documents:list"
 
 func (h *handler) cachedResponse(ctx context.Context, key string, tags []string, acceptBodyOmitted bool, load func(http.ResponseWriter) bool) (responsecache.Entry, bool) {
 	if entry, ok := h.deps.Cache.Get(ctx, key); ok && (acceptBodyOmitted || !entry.BodyOmitted) {
+		h.observeCache(ctx, true)
 		return entry, true
 	}
 	result := h.loads.DoChan(key, func() (any, error) {
@@ -34,7 +35,32 @@ func (h *handler) cachedResponse(ctx context.Context, key string, tags []string,
 			return responsecache.Entry{}, false
 		}
 		value := loaded.Val.(cacheLoad)
+		h.observeCache(ctx, value.hit)
+		h.observeCacheSize()
 		return value.entry, value.hit
+	}
+}
+
+func (h *handler) observeCache(ctx context.Context, hit bool) {
+	if state, ok := ctx.Value(observationKey).(*requestObservation); ok {
+		if hit {
+			state.cache = "hit"
+		} else {
+			state.cache = "miss"
+		}
+	}
+	if h.deps.Metrics != nil {
+		h.deps.Metrics.ObserveCache(hit)
+	}
+}
+
+func (h *handler) observeCacheSize() {
+	if h.deps.Metrics == nil {
+		return
+	}
+	if cache, ok := h.deps.Cache.(interface{ Stats() (int64, int) }); ok {
+		bytes, items := cache.Stats()
+		h.deps.Metrics.SetCacheSize(bytes, items)
 	}
 }
 
