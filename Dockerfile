@@ -13,15 +13,18 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -mod=vendor -trimpath -buildvcs=false -ldflags="-s -w -buildid=" -o /out/server ./cmd/server && \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -mod=vendor -trimpath -buildvcs=false -ldflags="-s -w -buildid=" -o /out/migrate ./cmd/migrate && \
-    mkdir -p /out/data/blobs
+    mkdir -p /out/data/blobs /out/run/documents-tmp && \
+    chmod 0700 /out/run/documents-tmp
 
 FROM scratch AS runtime
 
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build --chown=65532:65532 /out/data /data
+COPY --from=build --chown=65532:65532 --chmod=0700 /out/run/documents-tmp /run/documents-tmp
 COPY --from=build /out/server /usr/local/bin/server
 COPY --from=build /out/migrate /usr/local/bin/migrate
 
+ENV TMPDIR=/run/documents-tmp
 USER 65532:65532
 EXPOSE 8080
 STOPSIGNAL SIGTERM

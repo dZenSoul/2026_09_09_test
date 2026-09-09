@@ -1,7 +1,7 @@
 GO_FILES := $(shell find cmd internal -type f -name '*.go' -print)
 STATICCHECK_VERSION := 2024.1.1
 
-.PHONY: fmt fmt-check test test-race vet staticcheck check tools
+.PHONY: fmt fmt-check test test-container test-race vet staticcheck check tools
 
 fmt:
 	gofmt -w $(GO_FILES)
@@ -11,6 +11,9 @@ fmt-check:
 
 test:
 	go test ./...
+
+test-container:
+	RUN_DOCKER_MULTIPART_TEST=1 go test ./internal/httptransport -run TestRuntimeImageMultipartTemporaryStorage -count=1
 
 test-race:
 	go test -race ./...

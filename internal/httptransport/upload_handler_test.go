@@ -9,6 +9,8 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"documents/internal/document"
@@ -153,7 +155,138 @@ func TestUploadDocumentLimitBoundaries(t *testing.T) {
 	})
 }
 
+func TestUploadDocumentRemovesMultipartTemporaryFiles(t *testing.T) {
+	temporaryRoot := t.TempDir()
+	for _, name := range []string{"TMPDIR", "TMP", "TEMP"} {
+		t.Setenv(name, temporaryRoot)
+	}
+	if actual, err := filepath.Abs(os.TempDir()); err != nil || actual != temporaryRoot {
+		t.Fatalf("os.TempDir() = %q, want %q (err=%v)", actual, temporaryRoot, err)
+	}
+
+	tests := []struct {
+		name       string
+		meta       string
+		file       []byte
+		maxFile    int64
+		cancel     bool
+		wantStatus int
+	}{
+		{
+			name:       "success",
+			meta:       `{"name":"x.bin","file":true,"public":false,"token":"valid","mime":"application/octet-stream"}`,
+			file:       bytes.Repeat([]byte{0x5a}, 32),
+			maxFile:    64,
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "validation error",
+			meta:       `{"name":"x.bin","file":true,"public":false,"token":"valid"}`,
+			file:       bytes.Repeat([]byte{0x5a}, 32),
+			maxFile:    64,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "file limit",
+			meta:       `{"name":"x.bin","file":true,"public":false,"token":"valid","mime":"application/octet-stream"}`,
+			file:       bytes.Repeat([]byte{0x5a}, 32),
+			maxFile:    16,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "cancelled context",
+			meta:       `{"name":"x.bin","file":true,"public":false,"token":"valid","mime":"application/octet-stream"}`,
+			file:       bytes.Repeat([]byte{0x5a}, 32),
+			maxFile:    64,
+			cancel:     true,
+			wantStatus: http.StatusInternalServerError,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			documents := &uploadDocuments{}
+			auth := &uploadAuth{
+				user: domain.User{ID: "owner-id", Login: "owner000"}, respectContext: test.cancel,
+				temporaryDirectory: temporaryRoot,
+			}
+			handler := NewHandler(Dependencies{
+				Auth:      auth,
+				Documents: documents,
+				Limits: Limits{
+					MaxRequestBytes: 4096, MaxFileBytes: test.maxFile, MaxJSONBytes: 1, MaxGrantItems: 2,
+				},
+			})
+			request := newUploadRequest(t, test.meta, nil, test.file)
+			if test.cancel {
+				ctx, cancel := context.WithCancel(request.Context())
+				cancel()
+				request = request.WithContext(ctx)
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != test.wantStatus {
+				t.Fatalf("status=%d, want %d; body=%s", response.Code, test.wantStatus, response.Body)
+			}
+			if !auth.sawTemporaryFile {
+				t.Fatal("multipart file did not spill to temporary storage")
+			}
+			assertDirectoryEmpty(t, temporaryRoot)
+		})
+	}
+
+	t.Run("request limit while parsing", func(t *testing.T) {
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		filePart, err := writer.CreateFormFile("file", "x.bin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := filePart.Write(bytes.Repeat([]byte{0x5a}, 32)); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.WriteField("padding", string(bytes.Repeat([]byte{'p'}, 256))); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		handler := NewHandler(Dependencies{
+			Auth:      &uploadAuth{},
+			Documents: &uploadDocuments{},
+			Limits:    Limits{MaxRequestBytes: 192, MaxFileBytes: 64, MaxJSONBytes: 1, MaxGrantItems: 2},
+		})
+		request := httptest.NewRequest(http.MethodPost, "/api/docs", &body)
+		request.ContentLength = -1 // Exercise MaxBytesReader during multipart parsing.
+		request.Header.Set("Content-Type", writer.FormDataContentType())
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("status=%d body=%s", response.Code, response.Body)
+		}
+		assertDirectoryEmpty(t, temporaryRoot)
+	})
+}
+
+func assertDirectoryEmpty(t *testing.T, path string) {
+	t.Helper()
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("temporary directory contains %v", entries)
+	}
+}
+
 func performUpload(t *testing.T, handler http.Handler, meta string, jsonPart, file []byte) *httptest.ResponseRecorder {
+	t.Helper()
+	request := newUploadRequest(t, meta, jsonPart, file)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	return response
+}
+
+func newUploadRequest(t *testing.T, meta string, jsonPart, file []byte) *http.Request {
 	t.Helper()
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
@@ -183,14 +316,15 @@ func performUpload(t *testing.T, handler http.Handler, meta string, jsonPart, fi
 	}
 	request := httptest.NewRequest(http.MethodPost, "/api/docs", &body)
 	request.Header.Set("Content-Type", writer.FormDataContentType())
-	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, request)
-	return response
+	return request
 }
 
 type uploadAuth struct {
-	user domain.User
-	err  error
+	user               domain.User
+	err                error
+	respectContext     bool
+	temporaryDirectory string
+	sawTemporaryFile   bool
 }
 
 func (*uploadAuth) Register(context.Context, string, string, string) (domain.User, error) {
@@ -199,8 +333,21 @@ func (*uploadAuth) Register(context.Context, string, string, string) (domain.Use
 func (*uploadAuth) Authenticate(context.Context, string, string) (string, error) {
 	return "", errors.New("unused")
 }
-func (f *uploadAuth) Authorize(context.Context, string) (domain.User, error) { return f.user, f.err }
-func (*uploadAuth) Logout(context.Context, string) error                     { return errors.New("unused") }
+func (f *uploadAuth) Authorize(ctx context.Context, _ string) (domain.User, error) {
+	if f.temporaryDirectory != "" {
+		entries, _ := os.ReadDir(f.temporaryDirectory)
+		f.sawTemporaryFile = len(entries) > 0
+	}
+	if f.respectContext {
+		select {
+		case <-ctx.Done():
+			return domain.User{}, ctx.Err()
+		default:
+		}
+	}
+	return f.user, f.err
+}
+func (*uploadAuth) Logout(context.Context, string) error { return errors.New("unused") }
 
 type uploadDocuments struct {
 	input document.Upload

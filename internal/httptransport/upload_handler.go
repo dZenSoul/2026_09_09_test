@@ -37,11 +37,11 @@ func (h *handler) uploadDocument(w http.ResponseWriter, r *http.Request) {
 	// ParseMultipartForm retains ordinary fields in memory and streams file
 	// parts above this allowance to temporary files. The outer MaxBytesReader
 	// still enforces the complete HTTP request limit.
+	defer removeMultipartTemporaryFiles(r)
 	if err := r.ParseMultipartForm(h.deps.Limits.MaxJSONBytes); err != nil {
 		writeAPIError(w, http.StatusBadRequest, errorCodeBadRequest, "bad request")
 		return
 	}
-	defer r.MultipartForm.RemoveAll()
 	if !knownUploadParts(r.MultipartForm) {
 		writeAPIError(w, http.StatusBadRequest, errorCodeBadRequest, "bad request")
 		return
@@ -113,6 +113,12 @@ func (h *handler) uploadDocument(w http.ResponseWriter, r *http.Request) {
 		data["file"] = *meta.Name
 	}
 	writeData(w, http.StatusOK, data)
+}
+
+func removeMultipartTemporaryFiles(r *http.Request) {
+	if r.MultipartForm != nil {
+		_ = r.MultipartForm.RemoveAll()
+	}
 }
 
 func decodeUploadMeta(raw []byte) (uploadMeta, error) {
