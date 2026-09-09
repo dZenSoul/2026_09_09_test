@@ -254,7 +254,10 @@ func buildDocumentFilter(key, raw string) (string, any, error) {
 		if err != nil {
 			return "", nil, fmt.Errorf("document filter: %w", repository.ErrInvalidArgument)
 		}
-		return "d.created_at =", value.UTC(), nil
+		// The public representation intentionally has second precision. Compare
+		// at that same precision so a value copied from a list response matches
+		// the document even when PostgreSQL stored fractional seconds.
+		return "date_trunc('second', d.created_at) =", value.UTC().Truncate(time.Second), nil
 	default:
 		return "", nil, fmt.Errorf("document filter: %w", repository.ErrInvalidArgument)
 	}

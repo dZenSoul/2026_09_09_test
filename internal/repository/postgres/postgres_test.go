@@ -24,7 +24,7 @@ func TestBuildDocumentFilterWhitelistAndTypes(t *testing.T) {
 		{name: "mime", key: "mime", value: "application/json", wantSQL: "d.mime ="},
 		{name: "file", key: "file", value: "true", wantSQL: "d.is_file ="},
 		{name: "public", key: "public", value: "false", wantSQL: "d.is_public ="},
-		{name: "created", key: "created", value: "2026-09-09 10:30:56", wantSQL: "d.created_at ="},
+		{name: "created", key: "created", value: "2026-09-09 10:30:56", wantSQL: "date_trunc('second', d.created_at) ="},
 		{name: "unknown field", key: "name; DROP TABLE users", value: "x", wantErr: true},
 		{name: "invalid uuid", key: "id", value: "not-an-id", wantErr: true},
 		{name: "invalid bool", key: "public", value: "1", wantErr: true},

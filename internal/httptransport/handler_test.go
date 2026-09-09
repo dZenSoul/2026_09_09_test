@@ -128,12 +128,24 @@ func TestHEADHasGETHeadersAndNoBody(t *testing.T) {
 
 func TestRequestSizeLimit(t *testing.T) {
 	h := NewHandler(Dependencies{Limits: Limits{MaxRequestBytes: 3}})
-	recorder := httptest.NewRecorder()
-	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/api/register", strings.NewReader("four")))
-	if recorder.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", recorder.Code)
+	for _, test := range []struct {
+		name   string
+		body   string
+		status int
+	}{
+		{"below", "12", http.StatusNotImplemented},
+		{"at limit", "123", http.StatusNotImplemented},
+		{"above", "1234", http.StatusBadRequest},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/api/register", strings.NewReader(test.body)))
+			if recorder.Code != test.status {
+				t.Fatalf("status = %d, want %d", recorder.Code, test.status)
+			}
+			assertErrorEnvelope(t, recorder)
+		})
 	}
-	assertErrorEnvelope(t, recorder)
 }
 
 func TestPanicIsSafeAndSubsequentRequestsWork(t *testing.T) {

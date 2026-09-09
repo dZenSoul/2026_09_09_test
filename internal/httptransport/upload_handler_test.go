@@ -91,6 +91,68 @@ func TestUploadDocumentHTTPRejectsInvalidRequests(t *testing.T) {
 	}
 }
 
+func TestUploadDocumentLimitBoundaries(t *testing.T) {
+	t.Run("file and JSON", func(t *testing.T) {
+		for _, test := range []struct {
+			name   string
+			json   []byte
+			file   []byte
+			isFile bool
+			status int
+		}{
+			{"file below", nil, []byte("123"), true, http.StatusOK},
+			{"file at", nil, []byte("1234"), true, http.StatusOK},
+			{"file above", nil, []byte("12345"), true, http.StatusBadRequest},
+			{"JSON below", []byte(`{}`), nil, false, http.StatusOK},
+			{"JSON at", []byte(`null`), nil, false, http.StatusOK},
+			{"JSON above", []byte(`[123]`), nil, false, http.StatusBadRequest},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				documents := &uploadDocuments{}
+				handler := NewHandler(Dependencies{
+					Auth: &uploadAuth{user: domain.User{ID: "owner-id", Login: "owner000"}}, Documents: documents,
+					Limits: Limits{MaxRequestBytes: 4096, MaxFileBytes: 4, MaxJSONBytes: 4, MaxGrantItems: 2},
+				})
+				meta := `{"name":"value","file":false,"public":false,"token":"valid"}`
+				if test.isFile {
+					meta = `{"name":"value","file":true,"public":false,"token":"valid","mime":"application/octet-stream"}`
+				}
+				response := performUpload(t, handler, meta, test.json, test.file)
+				if response.Code != test.status {
+					t.Fatalf("status=%d, want %d; body=%s", response.Code, test.status, response.Body)
+				}
+			})
+		}
+	})
+
+	t.Run("grant", func(t *testing.T) {
+		for count := 1; count <= 3; count++ {
+			documents := &uploadDocuments{}
+			handler := NewHandler(Dependencies{
+				Auth: &uploadAuth{user: domain.User{ID: "owner-id", Login: "owner000"}}, Documents: documents,
+				Limits: Limits{MaxRequestBytes: 4096, MaxFileBytes: 4, MaxJSONBytes: 4, MaxGrantItems: 2},
+			})
+			grants := make([]string, count)
+			for index := range grants {
+				grants[index] = string(rune('a' + index))
+			}
+			encodedGrants, err := json.Marshal(grants)
+			if err != nil {
+				t.Fatal(err)
+			}
+			meta := `{"name":"value","file":false,"public":false,"token":"valid","grant":` + string(encodedGrants) + `}`
+			response := performUpload(t, handler, meta, []byte(`{}`), nil)
+			want := http.StatusOK
+			if count > 2 {
+				want = http.StatusBadRequest
+			}
+			if response.Code != want {
+				t.Fatalf("grant count %d status=%d, want %d", count, response.Code, want)
+			}
+		}
+	})
+}
+
 func performUpload(t *testing.T, handler http.Handler, meta string, jsonPart, file []byte) *httptest.ResponseRecorder {
 	t.Helper()
 	var body bytes.Buffer
