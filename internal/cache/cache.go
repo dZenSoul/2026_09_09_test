@@ -132,6 +132,19 @@ func (c *Memory) Stats() (bytes int64, items int) {
 	return c.bytes, c.lru.Len()
 }
 
+// EntryFits reports whether an entry with a body of bodyBytes can ever fit in
+// this cache. Callers use it before reading a blob so an oversized body is not
+// accumulated merely to have Set discard it afterwards.
+func (c *Memory) EntryFits(key string, entry Entry, bodyBytes int64) bool {
+	if bodyBytes < 0 {
+		return false
+	}
+	entry.Body = nil
+	entry.BodyOmitted = false
+	metadataBytes := entrySize(key, entry)
+	return metadataBytes <= c.maxBytes && bodyBytes <= c.maxBytes-metadataBytes
+}
+
 // Close releases all cache-held response bodies. It is safe to call more than once.
 func (c *Memory) Close() error {
 	c.mu.Lock()

@@ -7,8 +7,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
+	responsecache "documents/internal/cache"
 	"documents/internal/document"
 	"documents/internal/domain"
 )
@@ -53,6 +56,189 @@ func TestReadFileAndHEAD(t *testing.T) {
 	}
 	if documents.getCalls != 1 || documents.metadataCalls != 1 {
 		t.Fatalf("get calls=%d metadata calls=%d", documents.getCalls, documents.metadataCalls)
+	}
+}
+
+func TestReadFileStreamsBeforeSourceEOF(t *testing.T) {
+	reader := &stagedReadCloser{
+		first:   []byte("first"),
+		second:  []byte("second"),
+		release: make(chan struct{}),
+		closed:  make(chan struct{}),
+	}
+	metadata := domain.Document{Name: "stream.bin", MIME: "application/octet-stream", IsFile: true, SizeBytes: 11}
+	handler := NewHandler(Dependencies{
+		Auth:      &readAuth{user: domain.User{ID: "reader-id", Login: "reader000"}},
+		Documents: &readDocumentService{content: document.Content{Document: metadata, File: reader}},
+	})
+	w := newSignallingWriter()
+	done := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/docs/doc-id?token=session", nil))
+		close(done)
+	}()
+
+	select {
+	case <-w.wrote:
+		if got := w.bodyString(); got != "first" {
+			t.Fatalf("first streamed bytes = %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no bytes reached the writer before source EOF")
+	}
+	close(reader.release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("stream did not finish")
+	}
+	if got := w.bodyString(); got != "firstsecond" {
+		t.Fatalf("streamed body = %q", got)
+	}
+	select {
+	case <-reader.closed:
+	default:
+		t.Fatal("source was not closed")
+	}
+}
+
+func TestReadFileHEADCacheMissUsesOnlyMetadata(t *testing.T) {
+	metadata := domain.Document{Name: "large.bin", MIME: "application/octet-stream", IsFile: true, SizeBytes: 4096, Version: 2}
+	documents := &readDocumentService{metadata: metadata}
+	handler := NewHandler(Dependencies{
+		Auth:              &readAuth{user: domain.User{ID: "reader-id", Login: "reader000"}},
+		Documents:         documents,
+		Cache:             responsecache.NewMemory(1024, 10),
+		CacheTTL:          time.Minute,
+		ExposeCacheHeader: true,
+	})
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodHead, "/api/docs/doc-id?token=session", nil))
+	if response.Code != http.StatusOK || response.Body.Len() != 0 || response.Header().Get("Content-Length") != "4096" {
+		t.Fatalf("HEAD response: status=%d headers=%v body=%q", response.Code, response.Header(), response.Body)
+	}
+	if documents.getCalls != 0 || documents.metadataCalls != 1 {
+		t.Fatalf("get calls=%d metadata calls=%d", documents.getCalls, documents.metadataCalls)
+	}
+}
+
+func TestLargeFileCacheStoresMetadataWithoutCoalescingBody(t *testing.T) {
+	metadata := domain.Document{ID: "doc", Name: "large.bin", MIME: "application/octet-stream", IsFile: true, SizeBytes: 4096, Version: 3}
+	documents := &countingDocuments{metadata: metadata}
+	handler := NewHandler(Dependencies{
+		Auth:              &countingAuth{user: domain.User{ID: "reader-id", Login: "reader"}},
+		Documents:         documents,
+		Cache:             responsecache.NewMemory(1024, 10),
+		CacheTTL:          time.Minute,
+		ExposeCacheHeader: true,
+	})
+
+	for range 2 {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/docs/doc?token=session", nil))
+		if response.Code != http.StatusOK || response.Body.String() != "body" || response.Header().Get("X-Cache") != "MISS" {
+			t.Fatalf("GET response: status=%d cache=%q body=%q", response.Code, response.Header().Get("X-Cache"), response.Body)
+		}
+	}
+	if documents.GetCalls() != 2 {
+		t.Fatalf("large body Get calls=%d, want 2", documents.GetCalls())
+	}
+
+	head := httptest.NewRecorder()
+	handler.ServeHTTP(head, httptest.NewRequest(http.MethodHead, "/api/docs/doc?token=session", nil))
+	if head.Header().Get("X-Cache") != "HIT" || head.Body.Len() != 0 || documents.GetCalls() != 2 {
+		t.Fatalf("HEAD cache=%q body=%q Get calls=%d", head.Header().Get("X-Cache"), head.Body, documents.GetCalls())
+	}
+}
+
+func TestParallelLargeFileStreamsAreIndependent(t *testing.T) {
+	metadata := domain.Document{ID: "doc", Name: "large.bin", MIME: "application/octet-stream", IsFile: true, SizeBytes: 4096, Version: 4}
+	slow := &stagedReadCloser{
+		first: []byte("slow-"), second: []byte("done"),
+		release: make(chan struct{}), closed: make(chan struct{}),
+	}
+	documents := &parallelFileDocuments{metadata: metadata, first: slow}
+	handler := NewHandler(Dependencies{
+		Auth:      &countingAuth{user: domain.User{ID: "reader-id", Login: "reader"}},
+		Documents: documents,
+		Cache:     responsecache.NewMemory(1024, 10), CacheTTL: time.Minute,
+	})
+
+	slowWriter := newSignallingWriter()
+	slowDone := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(slowWriter, httptest.NewRequest(http.MethodGet, "/api/docs/doc?token=session", nil))
+		close(slowDone)
+	}()
+	select {
+	case <-slowWriter.wrote:
+	case <-time.After(time.Second):
+		t.Fatal("slow request did not begin streaming")
+	}
+
+	fastResponse := httptest.NewRecorder()
+	fastDone := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(fastResponse, httptest.NewRequest(http.MethodGet, "/api/docs/doc?token=session", nil))
+		close(fastDone)
+	}()
+	select {
+	case <-fastDone:
+		if fastResponse.Body.String() != "fast" {
+			t.Fatalf("fast body=%q", fastResponse.Body)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fast request was blocked by an independent slow stream")
+	}
+
+	close(slow.release)
+	select {
+	case <-slowDone:
+	case <-time.After(time.Second):
+		t.Fatal("slow request did not finish")
+	}
+	if slowWriter.bodyString() != "slow-done" || documents.GetCalls() != 2 {
+		t.Fatalf("slow body=%q Get calls=%d", slowWriter.bodyString(), documents.GetCalls())
+	}
+}
+
+func TestFileOpenFailureReturnsJSONBeforeStreaming(t *testing.T) {
+	metadata := domain.Document{ID: "doc", Name: "file.bin", MIME: "application/octet-stream", IsFile: true, SizeBytes: 4, Version: 1}
+	handler := NewHandler(Dependencies{
+		Auth:      &countingAuth{user: domain.User{ID: "reader-id", Login: "reader"}},
+		Documents: &countingDocuments{metadata: metadata, getErr: errors.New("blob unavailable")},
+		Cache:     responsecache.NewMemory(4096, 10), CacheTTL: time.Minute,
+	})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/docs/doc?token=session", nil))
+	if response.Code != http.StatusInternalServerError || response.Header().Get("Content-Type") != "application/json; charset=utf-8" || response.Body.String() != "{\"error\":{\"code\":500,\"text\":\"internal server error\"}}\n" {
+		t.Fatalf("response: status=%d headers=%v body=%q", response.Code, response.Header(), response.Body)
+	}
+}
+
+func TestFileWriteFailureClosesSourceAndCountsWrittenBytes(t *testing.T) {
+	closed := make(chan struct{})
+	reader := &closeTrackingReader{Reader: bytes.NewReader([]byte("abcdef")), closed: closed}
+	metadata := domain.Document{Name: "file.bin", MIME: "application/octet-stream", IsFile: true, SizeBytes: 6}
+	metrics := &fileMetricSpy{}
+	handler := NewHandler(Dependencies{
+		Auth:      &readAuth{user: domain.User{ID: "reader-id", Login: "reader000"}},
+		Documents: &readDocumentService{content: document.Content{Document: metadata, File: reader}},
+		Metrics:   metrics,
+	})
+	w := &failingResponseWriter{header: make(http.Header), limit: 2}
+	handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/docs/doc-id?token=session", nil))
+	select {
+	case <-closed:
+	default:
+		t.Fatal("source was not closed after client write failure")
+	}
+	if w.status != http.StatusOK || w.body.String() != "ab" {
+		t.Fatalf("partial response: status=%d body=%q", w.status, w.body.String())
+	}
+	if metrics.downloaded != 2 {
+		t.Fatalf("download metric=%d, want actual 2 bytes", metrics.downloaded)
 	}
 }
 
@@ -126,6 +312,147 @@ type readDocumentService struct {
 	err           error
 	getCalls      int
 	metadataCalls int
+}
+
+type stagedReadCloser struct {
+	first, second []byte
+	release       chan struct{}
+	closed        chan struct{}
+	reads         int
+	closeOnce     sync.Once
+}
+
+func (r *stagedReadCloser) Read(dst []byte) (int, error) {
+	switch r.reads {
+	case 0:
+		r.reads++
+		return copy(dst, r.first), nil
+	case 1:
+		r.reads++
+		<-r.release
+		return copy(dst, r.second), nil
+	default:
+		return 0, io.EOF
+	}
+}
+
+func (r *stagedReadCloser) Close() error {
+	r.closeOnce.Do(func() { close(r.closed) })
+	return nil
+}
+
+type signallingWriter struct {
+	mu     sync.Mutex
+	header http.Header
+	status int
+	body   bytes.Buffer
+	wrote  chan struct{}
+	once   sync.Once
+}
+
+func newSignallingWriter() *signallingWriter {
+	return &signallingWriter{header: make(http.Header), wrote: make(chan struct{})}
+}
+
+func (w *signallingWriter) Header() http.Header { return w.header }
+func (w *signallingWriter) WriteHeader(status int) {
+	w.mu.Lock()
+	w.status = status
+	w.mu.Unlock()
+}
+func (w *signallingWriter) Write(data []byte) (int, error) {
+	w.mu.Lock()
+	n, err := w.body.Write(data)
+	w.mu.Unlock()
+	w.once.Do(func() { close(w.wrote) })
+	return n, err
+}
+func (w *signallingWriter) bodyString() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.body.String()
+}
+
+type closeTrackingReader struct {
+	*bytes.Reader
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (r *closeTrackingReader) Close() error {
+	r.once.Do(func() { close(r.closed) })
+	return nil
+}
+
+type failingResponseWriter struct {
+	header http.Header
+	status int
+	body   bytes.Buffer
+	limit  int
+}
+
+func (w *failingResponseWriter) Header() http.Header { return w.header }
+func (w *failingResponseWriter) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+}
+func (w *failingResponseWriter) Write(data []byte) (int, error) {
+	remaining := w.limit - w.body.Len()
+	if remaining <= 0 {
+		return 0, errors.New("client disconnected")
+	}
+	if len(data) > remaining {
+		_, _ = w.body.Write(data[:remaining])
+		return remaining, errors.New("client disconnected")
+	}
+	return w.body.Write(data)
+}
+
+type fileMetricSpy struct{ downloaded int64 }
+
+func (*fileMetricSpy) ObserveRequest(string, string, int, float64) {}
+func (*fileMetricSpy) ObserveCache(bool)                           {}
+func (*fileMetricSpy) SetCacheSize(int64, int)                     {}
+func (m *fileMetricSpy) ObserveFile(direction string, bytes int64) {
+	if direction == "download" {
+		m.downloaded += bytes
+	}
+}
+
+type parallelFileDocuments struct {
+	mu       sync.Mutex
+	metadata domain.Document
+	first    io.ReadCloser
+	gets     int
+}
+
+func (*parallelFileDocuments) Upload(context.Context, domain.User, document.Upload) (domain.Document, error) {
+	return domain.Document{}, errors.New("unused")
+}
+func (*parallelFileDocuments) List(context.Context, domain.User, domain.DocumentFilter) ([]domain.Document, error) {
+	return nil, errors.New("unused")
+}
+func (d *parallelFileDocuments) Get(context.Context, domain.User, string) (document.Content, error) {
+	d.mu.Lock()
+	d.gets++
+	call := d.gets
+	d.mu.Unlock()
+	if call == 1 {
+		return document.Content{Document: d.metadata, File: d.first}, nil
+	}
+	return document.Content{Document: d.metadata, File: io.NopCloser(bytes.NewReader([]byte("fast")))}, nil
+}
+func (d *parallelFileDocuments) GetMetadata(context.Context, domain.User, string) (domain.Document, error) {
+	return d.metadata, nil
+}
+func (*parallelFileDocuments) Delete(context.Context, domain.User, string) error {
+	return errors.New("unused")
+}
+func (d *parallelFileDocuments) GetCalls() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.gets
 }
 
 func (*readDocumentService) Upload(context.Context, domain.User, document.Upload) (domain.Document, error) {

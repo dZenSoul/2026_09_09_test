@@ -108,11 +108,12 @@ func NewHandler(deps Dependencies) http.Handler {
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	var next http.Handler = http.HandlerFunc(h.route)
 	if h.deps.ProcessingTimeout > 0 {
-		next = http.TimeoutHandler(next, h.deps.ProcessingTimeout, "request timed out")
+		ctx, cancel := context.WithTimeout(r.Context(), h.deps.ProcessingTimeout)
+		defer cancel()
+		r = r.WithContext(ctx)
 	}
-	h.serveHTTP(w, r, next)
+	h.serveHTTP(w, r, http.HandlerFunc(h.route))
 }
 
 func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request, next http.Handler) {
@@ -123,7 +124,7 @@ func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request, next http.Ha
 	ctx := context.WithValue(r.Context(), requestIDKey, requestID)
 	r = r.WithContext(context.WithValue(ctx, observationKey, observation))
 
-	buffer := newBufferedResponse()
+	response := newObservedResponse(w, r.Method == http.MethodHead)
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			h.deps.Logger.Error("HTTP handler panic recovered",
@@ -131,10 +132,17 @@ func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request, next http.Ha
 				"route", normalizedRoute(r.URL.Path),
 				"method", r.Method,
 			)
-			buffer = newBufferedResponse()
-			writeAPIError(buffer, http.StatusInternalServerError, errorCodeInternal, "internal server error")
+			// Once streaming has started the status and partial body are already on
+			// the wire. Appending a JSON error would only corrupt that response.
+			if !response.committed {
+				requestIDHeader := response.Header().Get("X-Request-ID")
+				response.reset()
+				response.Header().Set("X-Request-ID", requestIDHeader)
+				writeAPIError(response, http.StatusInternalServerError, errorCodeInternal, "internal server error")
+			}
 		}
-		status := buffer.status
+		response.finish()
+		status := response.status
 		if status == 0 {
 			status = http.StatusOK
 		}
@@ -147,22 +155,21 @@ func (h *handler) serveHTTP(w http.ResponseWriter, r *http.Request, next http.Ha
 			"method", r.Method, "status", status, "duration_ms", duration.Milliseconds(), "cache", observation.cache)
 		if h.deps.Metrics != nil {
 			h.deps.Metrics.ObserveRequest(normalizedRoute(r.URL.Path), r.Method, status, duration.Seconds())
-			if disposition := buffer.header.Get("Content-Disposition"); r.Method != http.MethodHead && disposition != "" {
-				h.deps.Metrics.ObserveFile("download", int64(buffer.body.Len()))
+			if disposition := response.Header().Get("Content-Disposition"); r.Method != http.MethodHead && disposition != "" {
+				h.deps.Metrics.ObserveFile("download", response.bytesWritten)
 			}
 		}
-		buffer.commit(w, r.Method == http.MethodHead)
 	}()
 
 	if r.ContentLength > h.deps.Limits.MaxRequestBytes {
-		writeAPIError(buffer, http.StatusBadRequest, errorCodeBadRequest, "request body is too large")
+		writeAPIError(response, http.StatusBadRequest, errorCodeBadRequest, "request body is too large")
 		return
 	}
 	if r.Body != nil {
-		r.Body = http.MaxBytesReader(buffer, r.Body, h.deps.Limits.MaxRequestBytes)
+		r.Body = http.MaxBytesReader(response, r.Body, h.deps.Limits.MaxRequestBytes)
 	}
 
-	next.ServeHTTP(buffer, r)
+	next.ServeHTTP(response, r)
 }
 
 func (h *handler) route(w http.ResponseWriter, r *http.Request) {
@@ -321,48 +328,116 @@ func methodNotAllowed(w http.ResponseWriter, allowed ...string) {
 	writeAPIError(w, http.StatusMethodNotAllowed, errorCodeMethodNotAllowed, "method not allowed")
 }
 
-// bufferedResponse prevents a panic after a partial write from leaking a
-// truncated response. It also lets HEAD calculate GET's content length while
-// suppressing every body byte, including error bodies.
-type bufferedResponse struct {
-	header http.Header
-	body   bytes.Buffer
-	status int
+// observedResponse keeps ordinary small responses atomic until the handler
+// returns. File handlers explicitly switch it to streaming after every
+// fallible precondition (authorization, metadata lookup and blob open) passes.
+type observedResponse struct {
+	dst          http.ResponseWriter
+	head         bool
+	header       http.Header
+	body         bytes.Buffer
+	status       int
+	wroteHeader  bool
+	committed    bool
+	bytesWritten int64
 }
 
-func newBufferedResponse() *bufferedResponse {
-	return &bufferedResponse{header: make(http.Header)}
+func newObservedResponse(dst http.ResponseWriter, head bool) *observedResponse {
+	return &observedResponse{dst: dst, head: head, header: cloneHeader(dst.Header())}
 }
 
-func (w *bufferedResponse) Header() http.Header { return w.header }
+func (w *observedResponse) Header() http.Header {
+	if w.committed {
+		return w.dst.Header()
+	}
+	return w.header
+}
 
-func (w *bufferedResponse) WriteHeader(status int) {
-	if w.status == 0 {
-		w.status = status
+func (w *observedResponse) WriteHeader(status int) {
+	if w.wroteHeader {
+		return
+	}
+	w.status = status
+	w.wroteHeader = true
+	if w.committed {
+		w.dst.WriteHeader(status)
 	}
 }
 
-func (w *bufferedResponse) Write(data []byte) (int, error) {
-	if w.status == 0 {
+func (w *observedResponse) Write(data []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	if w.head {
+		return len(data), nil
+	}
+	if !w.committed {
+		return w.body.Write(data)
+	}
+	n, err := w.dst.Write(data)
+	w.bytesWritten += int64(n)
+	return n, err
+}
+
+func (w *observedResponse) Flush() {
+	w.startStreaming()
+	if flusher, ok := w.dst.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (w *observedResponse) startStreaming() {
+	if w.committed {
+		return
+	}
+	if !w.wroteHeader {
 		w.status = http.StatusOK
+		w.wroteHeader = true
 	}
-	return w.body.Write(data)
+	copyResponseHeader(w.dst.Header(), w.header)
+	w.dst.WriteHeader(w.status)
+	w.committed = true
+	if !w.head && w.body.Len() != 0 {
+		n, _ := w.dst.Write(w.body.Bytes())
+		w.bytesWritten += int64(n)
+	}
+	w.body.Reset()
 }
 
-func (w *bufferedResponse) commit(dst http.ResponseWriter, head bool) {
-	for name, values := range w.header {
-		dst.Header()[name] = append([]string(nil), values...)
+func (w *observedResponse) finish() {
+	if w.committed {
+		return
 	}
-	status := w.status
-	if status == 0 {
-		status = http.StatusOK
+	if !w.wroteHeader {
+		w.status = http.StatusOK
+		w.wroteHeader = true
 	}
-	if dst.Header().Get("Content-Length") == "" && responseMayHaveBody(status) {
-		dst.Header().Set("Content-Length", strconv.Itoa(w.body.Len()))
+	if w.header.Get("Content-Length") == "" && responseMayHaveBody(w.status) {
+		w.header.Set("Content-Length", strconv.Itoa(w.body.Len()))
 	}
-	dst.WriteHeader(status)
-	if !head && responseMayHaveBody(status) {
-		_, _ = dst.Write(w.body.Bytes())
+	copyResponseHeader(w.dst.Header(), w.header)
+	w.dst.WriteHeader(w.status)
+	w.committed = true
+	if !w.head && responseMayHaveBody(w.status) {
+		n, _ := w.dst.Write(w.body.Bytes())
+		w.bytesWritten += int64(n)
+	}
+	w.body.Reset()
+}
+
+func (w *observedResponse) reset() {
+	w.header = make(http.Header)
+	w.body.Reset()
+	w.status = 0
+	w.wroteHeader = false
+}
+
+func copyResponseHeader(dst, src http.Header) {
+	for name := range dst {
+		delete(dst, name)
+	}
+	for name, values := range src {
+		dst[name] = append([]string(nil), values...)
 	}
 }
 

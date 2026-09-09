@@ -1,6 +1,7 @@
 package httptransport
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/http"
@@ -9,6 +10,34 @@ import (
 )
 
 const listCacheTag = "documents:list"
+
+// bufferedResponse is intentionally limited to small, non-streaming responses
+// such as list and JSON documents. File responses use the direct streaming
+// path in read_handler.go.
+type bufferedResponse struct {
+	header http.Header
+	body   bytes.Buffer
+	status int
+}
+
+func newBufferedResponse() *bufferedResponse {
+	return &bufferedResponse{header: make(http.Header)}
+}
+
+func (w *bufferedResponse) Header() http.Header { return w.header }
+
+func (w *bufferedResponse) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+}
+
+func (w *bufferedResponse) Write(data []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.body.Write(data)
+}
 
 func (h *handler) cachedResponse(ctx context.Context, key string, tags []string, acceptBodyOmitted bool, load func(http.ResponseWriter) bool) (responsecache.Entry, bool) {
 	if entry, ok := h.deps.Cache.Get(ctx, key); ok && (acceptBodyOmitted || !entry.BodyOmitted) {

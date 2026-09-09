@@ -53,10 +53,10 @@ func TestResponseCacheDoesNotCacheErrors(t *testing.T) {
 	}
 }
 
-func TestResponseCacheCoalescesConcurrentMisses(t *testing.T) {
+func TestResponseCacheCoalescesConcurrentJSONMisses(t *testing.T) {
 	auth := &countingAuth{user: domain.User{ID: "reader-id", Login: "reader"}}
 	documents := &countingDocuments{
-		metadata: domain.Document{ID: "doc", Version: 1, IsFile: true, Name: "x", MIME: "text/plain", SizeBytes: 4},
+		metadata: domain.Document{ID: "doc", Version: 1, JSON: []byte(`"body"`)},
 		gate:     make(chan struct{}), started: make(chan struct{}),
 	}
 	handler := NewHandler(Dependencies{Auth: auth, Documents: documents, Cache: responsecache.NewMemory(4096, 10), CacheTTL: time.Minute})
@@ -69,7 +69,7 @@ func TestResponseCacheCoalescesConcurrentMisses(t *testing.T) {
 			defer wait.Done()
 			response := httptest.NewRecorder()
 			handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/docs/doc?token=secret", nil))
-			if response.Code != http.StatusOK || response.Body.String() != "body" {
+			if response.Code != http.StatusOK || response.Body.String() != "{\"data\":\"body\"}\n" {
 				t.Errorf("status=%d body=%q", response.Code, response.Body)
 			}
 		}()

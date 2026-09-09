@@ -1,6 +1,7 @@
 package httptransport
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 
+	responsecache "documents/internal/cache"
 	"documents/internal/document"
 	"documents/internal/domain"
 )
@@ -17,6 +19,8 @@ import (
 type documentMetadataReader interface {
 	GetMetadata(context.Context, domain.User, string) (domain.Document, error)
 }
+
+const fileCopyBufferBytes = 32 << 10
 
 func (h *handler) readDocument(w http.ResponseWriter, r *http.Request, id string) {
 	if h.deps.Auth == nil || h.deps.Documents == nil {
@@ -54,6 +58,10 @@ func (h *handler) readDocument(w http.ResponseWriter, r *http.Request, id string
 				writeDomainError(w, err)
 				return
 			}
+			if metadata.IsFile {
+				h.readFileWithCache(w, r, requester, id, metadata)
+				return
+			}
 			entry, hit := h.cachedResponse(r.Context(), h.documentCacheKey(id, metadata.Version), []string{"document:" + id}, r.Method == http.MethodHead, func(dst http.ResponseWriter) bool {
 				return h.loadDocumentContent(dst, r, requester, id)
 			})
@@ -73,9 +81,120 @@ func (h *handler) readDocument(w http.ResponseWriter, r *http.Request, id string
 			writeDocumentMetadata(w, metadata)
 			return
 		}
+		// HEAD must never fall back to Get because Get opens file blobs. The
+		// production document service always implements documentMetadataReader.
+		writeAPIError(w, http.StatusInternalServerError, errorCodeInternal, "internal server error")
+		return
 	}
 
 	h.loadDocumentContent(w, r, requester, id)
+}
+
+type cacheEntrySizer interface {
+	EntryFits(key string, entry responsecache.Entry, bodyBytes int64) bool
+}
+
+func (h *handler) readFileWithCache(w http.ResponseWriter, r *http.Request, requester domain.User, id string, metadata domain.Document) {
+	key := h.documentCacheKey(id, metadata.Version)
+	tags := []string{"document:" + id}
+	entry, found := h.deps.Cache.Get(r.Context(), key)
+
+	if r.Method == http.MethodHead {
+		if found {
+			h.observeCache(r.Context(), true)
+			h.exposeCacheStatus(w, true)
+			writeCachedResponse(w, entry)
+			return
+		}
+		entry = fileMetadataEntry(metadata, tags)
+		h.deps.Cache.Set(context.WithoutCancel(r.Context()), key, entry, h.deps.CacheTTL)
+		h.observeCache(r.Context(), false)
+		h.observeCacheSize()
+		h.exposeCacheStatus(w, false)
+		writeCachedResponse(w, entry)
+		return
+	}
+
+	if found && !entry.BodyOmitted {
+		h.observeCache(r.Context(), true)
+		h.exposeCacheStatus(w, true)
+		writeCachedFileResponse(w, entry)
+		return
+	}
+
+	h.observeCache(r.Context(), false)
+	h.exposeCacheStatus(w, false)
+	content, err := h.deps.Documents.Get(r.Context(), requester, id)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	if content.File == nil {
+		writeAPIError(w, http.StatusInternalServerError, errorCodeInternal, "internal server error")
+		return
+	}
+	defer content.File.Close()
+
+	entry = fileMetadataEntry(content.Document, tags)
+	cacheBody := false
+	if sizer, ok := h.deps.Cache.(cacheEntrySizer); ok {
+		cacheBody = sizer.EntryFits(key, entry, content.Document.SizeBytes)
+	}
+	if !cacheBody {
+		h.deps.Cache.Set(context.WithoutCancel(r.Context()), key, entry, h.deps.CacheTTL)
+		h.observeCacheSize()
+		_ = writeFileStream(w, content, nil)
+		return
+	}
+
+	capture := &boundedCapture{remaining: content.Document.SizeBytes}
+	if err := writeFileStream(w, content, capture); err != nil || capture.overflow || int64(capture.buffer.Len()) != content.Document.SizeBytes {
+		return
+	}
+	entry.Body = capture.buffer.Bytes()
+	entry.BodyOmitted = false
+	h.deps.Cache.Set(context.WithoutCancel(r.Context()), key, entry, h.deps.CacheTTL)
+	h.observeCacheSize()
+}
+
+func fileMetadataEntry(metadata domain.Document, tags []string) responsecache.Entry {
+	header := make(http.Header)
+	writeFileHeaders(headerWriter{header: header}, metadata)
+	return responsecache.Entry{
+		Status:      http.StatusOK,
+		Header:      header,
+		BodyOmitted: true,
+		Tags:        append([]string(nil), tags...),
+	}
+}
+
+type headerWriter struct{ header http.Header }
+
+func (w headerWriter) Header() http.Header          { return w.header }
+func (headerWriter) WriteHeader(int)                {}
+func (headerWriter) Write(data []byte) (int, error) { return len(data), nil }
+
+// boundedCapture accepts the complete stream but retains at most the declared
+// cache budget. A blob larger than its metadata is still sent to the client and
+// simply becomes ineligible for body caching.
+type boundedCapture struct {
+	buffer    bytes.Buffer
+	remaining int64
+	overflow  bool
+}
+
+func (w *boundedCapture) Write(data []byte) (int, error) {
+	if int64(len(data)) > w.remaining {
+		if w.remaining > 0 {
+			_, _ = w.buffer.Write(data[:int(w.remaining)])
+		}
+		w.remaining = 0
+		w.overflow = true
+		return len(data), nil
+	}
+	w.remaining -= int64(len(data))
+	_, _ = w.buffer.Write(data)
+	return len(data), nil
 }
 
 func (h *handler) loadDocumentContent(w http.ResponseWriter, r *http.Request, requester domain.User, id string) bool {
@@ -108,10 +227,43 @@ func writeDocumentContent(w http.ResponseWriter, content document.Content) error
 		writeAPIError(w, http.StatusInternalServerError, errorCodeInternal, "internal server error")
 		return errors.New("file document has no body")
 	}
+	return writeFileStream(w, content, nil)
+}
+
+func writeFileStream(w http.ResponseWriter, content document.Content, capture io.Writer) error {
 	writeFileHeaders(w, content.Document)
+	beginStreaming(w)
 	w.WriteHeader(http.StatusOK)
-	_, err := io.Copy(w, content.File)
+	destination := io.Writer(w)
+	if capture != nil {
+		destination = io.MultiWriter(w, capture)
+	}
+	// Hide optional WriterTo implementations so every storage driver follows
+	// the same bounded-copy path instead of being allowed to allocate or write a
+	// whole object in one call.
+	_, err := io.CopyBuffer(destination, readerOnly{Reader: content.File}, make([]byte, fileCopyBufferBytes))
 	return err
+}
+
+type readerOnly struct{ io.Reader }
+
+func writeCachedFileResponse(w http.ResponseWriter, entry responsecache.Entry) {
+	for name, values := range entry.Header {
+		w.Header()[name] = append([]string(nil), values...)
+	}
+	beginStreaming(w)
+	status := entry.Status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	w.WriteHeader(status)
+	_, _ = w.Write(entry.Body)
+}
+
+func beginStreaming(w http.ResponseWriter) {
+	if streaming, ok := w.(interface{ startStreaming() }); ok {
+		streaming.startStreaming()
+	}
 }
 
 func writeFileHeaders(w http.ResponseWriter, metadata domain.Document) {
