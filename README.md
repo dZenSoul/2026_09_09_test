@@ -16,8 +16,6 @@
 - `internal/blob` — атомарное файловое blob-хранилище;
 - `internal/cache` — локальный TTL/LRU-кэш.
 
-Полный контракт находится в [`docs/SPECIFICATION.md`](docs/SPECIFICATION.md).
-
 ## Требования
 
 Для рекомендуемого запуска нужны Docker Engine и Docker Compose. Для запуска без контейнеров нужны Go 1.23.3 и PostgreSQL 18; команды проверки дополнительно используют GNU Make и Staticcheck 2024.1.1. Примеры API рассчитаны на `curl`.
