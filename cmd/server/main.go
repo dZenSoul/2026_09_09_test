@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"documents/internal/auth"
 	"documents/internal/config"
 	"documents/internal/httptransport"
 	"documents/internal/observability"
@@ -41,8 +42,16 @@ func run() error {
 	if err := store.MigrateUp(databaseCtx); err != nil {
 		return err
 	}
+	authService, err := auth.NewService(store.Users(), store.Sessions(), auth.Config{
+		AdminToken: cfg.AdminToken,
+		SessionTTL: cfg.SessionTTL,
+	})
+	if err != nil {
+		return err
+	}
 
 	handler := httptransport.NewHandler(httptransport.Dependencies{
+		Auth:   authService,
 		Logger: logger,
 		Limits: httptransport.Limits{
 			MaxRequestBytes: cfg.MaxRequestBytes,

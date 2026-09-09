@@ -105,11 +105,23 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request) {
 		}
 		writeResponse(w, http.StatusOK, map[string]string{"status": "ok"})
 	case path == "/api/register":
-		h.operation(w, r, http.MethodPost)
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		h.register(w, r)
 	case path == "/api/auth":
-		h.operation(w, r, http.MethodPost)
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		h.authenticate(w, r)
 	case singlePathValue(path, "/api/auth/"):
-		h.operation(w, r, http.MethodDelete)
+		if r.Method != http.MethodDelete {
+			methodNotAllowed(w, http.MethodDelete)
+			return
+		}
+		h.logout(w, r, strings.TrimPrefix(path, "/api/auth/"))
 	case path == "/api/docs":
 		h.operation(w, r, http.MethodGet, http.MethodHead, http.MethodPost)
 	case singlePathValue(path, "/api/docs/"):
@@ -117,6 +129,63 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeAPIError(w, http.StatusNotFound, errorCodeNotFound, "resource not found")
 	}
+}
+
+func (h *handler) register(w http.ResponseWriter, r *http.Request) {
+	if h.deps.Auth == nil {
+		writeAPIError(w, http.StatusNotImplemented, errorCodeNotImplemented, "operation not implemented")
+		return
+	}
+	if !parseURLForm(w, r) {
+		return
+	}
+	user, err := h.deps.Auth.Register(r.Context(), r.PostForm.Get("token"), r.PostForm.Get("login"), r.PostForm.Get("pswd"))
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeResponse(w, http.StatusOK, map[string]string{"login": user.Login})
+}
+
+func (h *handler) authenticate(w http.ResponseWriter, r *http.Request) {
+	if h.deps.Auth == nil {
+		writeAPIError(w, http.StatusNotImplemented, errorCodeNotImplemented, "operation not implemented")
+		return
+	}
+	if !parseURLForm(w, r) {
+		return
+	}
+	token, err := h.deps.Auth.Authenticate(r.Context(), r.PostForm.Get("login"), r.PostForm.Get("pswd"))
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeResponse(w, http.StatusOK, map[string]string{"token": token})
+}
+
+func (h *handler) logout(w http.ResponseWriter, r *http.Request, token string) {
+	if h.deps.Auth == nil {
+		writeAPIError(w, http.StatusNotImplemented, errorCodeNotImplemented, "operation not implemented")
+		return
+	}
+	if err := h.deps.Auth.Logout(r.Context(), token); err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeResponse(w, http.StatusOK, map[string]bool{token: true})
+}
+
+func parseURLForm(w http.ResponseWriter, r *http.Request) bool {
+	contentType := r.Header.Get("Content-Type")
+	if mediaType := strings.TrimSpace(strings.SplitN(contentType, ";", 2)[0]); mediaType != "application/x-www-form-urlencoded" {
+		writeAPIError(w, http.StatusBadRequest, errorCodeBadRequest, "bad request")
+		return false
+	}
+	if err := r.ParseForm(); err != nil {
+		writeAPIError(w, http.StatusBadRequest, errorCodeBadRequest, "bad request")
+		return false
+	}
+	return true
 }
 
 func singlePathValue(path, prefix string) bool {
