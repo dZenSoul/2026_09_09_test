@@ -1,6 +1,7 @@
 package httptransport
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/url"
@@ -33,6 +34,10 @@ func (h *handler) deleteDocument(w http.ResponseWriter, r *http.Request, id stri
 	if err := h.deps.Documents.Delete(r.Context(), requester, id); err != nil {
 		writeDomainError(w, err)
 		return
+	}
+	if h.deps.Cache != nil {
+		h.cacheEpoch.Add(1)
+		h.deps.Cache.Invalidate(context.WithoutCancel(r.Context()), listCacheTag, "document:"+id)
 	}
 	writeResponse(w, http.StatusOK, map[string]bool{id: true})
 }

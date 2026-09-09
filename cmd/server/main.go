@@ -11,6 +11,7 @@ import (
 
 	"documents/internal/auth"
 	"documents/internal/blob"
+	responsecache "documents/internal/cache"
 	"documents/internal/config"
 	"documents/internal/document"
 	"documents/internal/httptransport"
@@ -68,9 +69,12 @@ func run() error {
 	}
 
 	handler := httptransport.NewHandler(httptransport.Dependencies{
-		Auth:      authService,
-		Documents: documentService,
-		Logger:    logger,
+		Auth:              authService,
+		Documents:         documentService,
+		Cache:             responsecache.NewMemory(cfg.CacheMaxBytes, cfg.CacheMaxItems),
+		CacheTTL:          cfg.CacheTTL,
+		ExposeCacheHeader: cfg.ExposeCacheHeader,
+		Logger:            logger,
 		Limits: httptransport.Limits{
 			MaxRequestBytes: cfg.MaxRequestBytes,
 			MaxFileBytes:    cfg.MaxFileBytes,

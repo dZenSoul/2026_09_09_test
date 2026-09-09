@@ -3,6 +3,7 @@ package httptransport
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"mime"
 	"net/http"
@@ -45,6 +46,22 @@ func (h *handler) readDocument(w http.ResponseWriter, r *http.Request, id string
 		writeDomainError(w, err)
 		return
 	}
+	if h.deps.Cache != nil {
+		reader, supported := h.deps.Documents.(documentMetadataReader)
+		if supported {
+			metadata, err := reader.GetMetadata(r.Context(), requester, id)
+			if err != nil {
+				writeDomainError(w, err)
+				return
+			}
+			entry, hit := h.cachedResponse(r.Context(), h.documentCacheKey(id, metadata.Version), []string{"document:" + id}, r.Method == http.MethodHead, func(dst http.ResponseWriter) bool {
+				return h.loadDocumentContent(dst, r, requester, id)
+			})
+			h.exposeCacheStatus(w, hit)
+			writeCachedResponse(w, entry)
+			return
+		}
+	}
 
 	if r.Method == http.MethodHead {
 		if reader, supported := h.deps.Documents.(documentMetadataReader); supported {
@@ -58,19 +75,19 @@ func (h *handler) readDocument(w http.ResponseWriter, r *http.Request, id string
 		}
 	}
 
+	h.loadDocumentContent(w, r, requester, id)
+}
+
+func (h *handler) loadDocumentContent(w http.ResponseWriter, r *http.Request, requester domain.User, id string) bool {
 	content, err := h.deps.Documents.Get(r.Context(), requester, id)
 	if err != nil {
 		writeDomainError(w, err)
-		return
+		return false
 	}
 	if content.File != nil {
 		defer content.File.Close()
 	}
-	if r.Method == http.MethodHead {
-		writeDocumentMetadata(w, content.Document)
-		return
-	}
-	writeDocumentContent(w, content)
+	return writeDocumentContent(w, content) == nil
 }
 
 func writeDocumentMetadata(w http.ResponseWriter, metadata domain.Document) {
@@ -82,18 +99,19 @@ func writeDocumentMetadata(w http.ResponseWriter, metadata domain.Document) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func writeDocumentContent(w http.ResponseWriter, content document.Content) {
+func writeDocumentContent(w http.ResponseWriter, content document.Content) error {
 	if !content.Document.IsFile {
 		writeData(w, http.StatusOK, json.RawMessage(content.Document.JSON))
-		return
+		return nil
 	}
 	if content.File == nil {
 		writeAPIError(w, http.StatusInternalServerError, errorCodeInternal, "internal server error")
-		return
+		return errors.New("file document has no body")
 	}
 	writeFileHeaders(w, content.Document)
 	w.WriteHeader(http.StatusOK)
-	_, _ = io.Copy(w, content.File)
+	_, err := io.Copy(w, content.File)
+	return err
 }
 
 func writeFileHeaders(w http.ResponseWriter, metadata domain.Document) {

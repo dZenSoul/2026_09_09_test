@@ -1,6 +1,7 @@
 package httptransport
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -94,6 +95,10 @@ func (h *handler) uploadDocument(w http.ResponseWriter, r *http.Request) {
 	if _, err := h.deps.Documents.Upload(r.Context(), requester, input); err != nil {
 		writeDomainError(w, err)
 		return
+	}
+	if h.deps.Cache != nil {
+		h.cacheEpoch.Add(1)
+		h.deps.Cache.Invalidate(context.WithoutCancel(r.Context()), listCacheTag)
 	}
 
 	data := make(map[string]any, 2)

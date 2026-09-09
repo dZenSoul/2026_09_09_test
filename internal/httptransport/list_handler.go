@@ -50,10 +50,22 @@ func (h *handler) listDocuments(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, errorCodeBadRequest, "bad request")
 		return
 	}
+	if h.deps.Cache != nil {
+		entry, hit := h.cachedResponse(r.Context(), h.listCacheKey(requester.ID, filter.OwnerLogin, filter.Key, filter.Value, filter.Limit), []string{listCacheTag}, r.Method == http.MethodHead, func(dst http.ResponseWriter) bool {
+			return h.loadDocumentList(dst, r, requester, filter)
+		})
+		h.exposeCacheStatus(w, hit)
+		writeCachedResponse(w, entry)
+		return
+	}
+	h.loadDocumentList(w, r, requester, filter)
+}
+
+func (h *handler) loadDocumentList(w http.ResponseWriter, r *http.Request, requester domain.User, filter domain.DocumentFilter) bool {
 	documents, err := h.deps.Documents.List(r.Context(), requester, filter)
 	if err != nil {
 		writeDomainError(w, err)
-		return
+		return false
 	}
 
 	items := make([]documentListItem, len(documents))
@@ -69,6 +81,7 @@ func (h *handler) listDocuments(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeData(w, http.StatusOK, map[string]any{"docs": items})
+	return true
 }
 
 func (h *handler) parseDocumentListFilter(query url.Values) (domain.DocumentFilter, bool) {
@@ -125,6 +138,24 @@ func validDocumentListFilterValue(key, value string) bool {
 	default:
 		return false
 	}
+}
+
+func normalizedFilterValue(key, value string) string {
+	switch key {
+	case "id":
+		if parsed, err := uuid.Parse(value); err == nil {
+			return parsed.String()
+		}
+	case "created":
+		parsed, err := time.ParseInLocation(responseDocumentTimeFormat, value, time.UTC)
+		if err != nil {
+			parsed, err = time.Parse(time.RFC3339, value)
+		}
+		if err == nil {
+			return parsed.UTC().Format(time.RFC3339Nano)
+		}
+	}
+	return value
 }
 
 func singleQueryValue(query url.Values, name string) (string, bool) {

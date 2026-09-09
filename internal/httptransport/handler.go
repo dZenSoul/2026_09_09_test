@@ -8,11 +8,15 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"documents/internal/auth"
+	responsecache "documents/internal/cache"
 	"documents/internal/document"
 
 	"github.com/google/uuid"
+	"golang.org/x/sync/singleflight"
 )
 
 const defaultMaxRequestBytes int64 = 32 << 20
@@ -36,14 +40,19 @@ type Limits struct {
 }
 
 type Dependencies struct {
-	Auth      auth.Service
-	Documents document.Service
-	Logger    *slog.Logger
-	Limits    Limits
+	Auth              auth.Service
+	Documents         document.Service
+	Cache             responsecache.Cache
+	CacheTTL          time.Duration
+	ExposeCacheHeader bool
+	Logger            *slog.Logger
+	Limits            Limits
 }
 
 type handler struct {
-	deps Dependencies
+	deps       Dependencies
+	loads      singleflight.Group
+	cacheEpoch atomic.Uint64
 }
 
 type contextKey uint8
@@ -77,6 +86,9 @@ func NewHandler(deps Dependencies) http.Handler {
 	}
 	if deps.Limits.MaxListLimit <= 0 {
 		deps.Limits.MaxListLimit = defaultMaxListLimit
+	}
+	if deps.Cache != nil && deps.CacheTTL <= 0 {
+		deps.CacheTTL = 5 * time.Minute
 	}
 	return &handler{deps: deps}
 }
