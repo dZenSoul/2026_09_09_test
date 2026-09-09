@@ -48,9 +48,6 @@ func run() error {
 		return err
 	}
 	defer store.Close()
-	if err := store.MigrateUp(databaseCtx); err != nil {
-		return err
-	}
 	authService, err := auth.NewService(store.Users(), store.Sessions(), auth.Config{
 		AdminToken: cfg.AdminToken,
 		SessionTTL: cfg.SessionTTL,

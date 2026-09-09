@@ -1,0 +1,9 @@
+**
+!go.mod
+!go.sum
+!vendor/
+!vendor/**
+!cmd/
+!cmd/**
+!internal/
+!internal/**
