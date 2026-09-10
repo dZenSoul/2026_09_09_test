@@ -21,6 +21,8 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -32,6 +34,13 @@ type config struct {
 	adminToken     string
 	readyTimeout   time.Duration
 	requestTimeout time.Duration
+	mode           string
+	loadProfile    string
+	loadDuration   time.Duration
+	workers        int
+	maxOPS         int
+	maxErrorRate   float64
+	maxP95         time.Duration
 }
 
 type runner struct {
@@ -41,6 +50,7 @@ type runner struct {
 	tokens map[string]string
 	docs   []ownedDocument
 	names  []ownedName
+	mu     sync.Mutex
 }
 
 type ownedDocument struct {
@@ -71,7 +81,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	r := &runner{
-		cfg: cfg, client: &http.Client{Timeout: cfg.requestTimeout}, out: os.Stdout,
+		cfg: cfg, client: newHTTPClient(cfg), out: os.Stdout,
 		tokens: make(map[string]string),
 	}
 	if err := r.run(ctx); err != nil {
@@ -84,10 +94,17 @@ func parseConfig(args []string) (config, error) {
 	fs := flag.NewFlagSet("stacktest", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	cfg := config{}
-	fs.StringVar(&cfg.baseURL, "base-url", envOr("STACKTEST_BASE_URL", "http://localhost:8080"), "service base URL")
+	fs.StringVar(&cfg.baseURL, "base-url", envOr("STACKTEST_BASE_URL", "http://127.0.0.1:8080"), "service base URL")
 	fs.StringVar(&cfg.adminToken, "admin-token", os.Getenv("ADMIN_TOKEN"), "registration token (prefer ADMIN_TOKEN env)")
 	fs.DurationVar(&cfg.readyTimeout, "ready-timeout", 60*time.Second, "maximum readiness wait")
 	fs.DurationVar(&cfg.requestTimeout, "request-timeout", 10*time.Second, "timeout for one HTTP request")
+	fs.StringVar(&cfg.mode, "mode", "smoke", "test mode: smoke or load")
+	fs.StringVar(&cfg.loadProfile, "load-profile", "read", "load profile: read or mixed")
+	fs.DurationVar(&cfg.loadDuration, "load-duration", 30*time.Second, "load generation duration")
+	fs.IntVar(&cfg.workers, "workers", 16, "number of concurrent load workers")
+	fs.IntVar(&cfg.maxOPS, "max-ops", 0, "maximum operations per second; 0 means unlimited")
+	fs.Float64Var(&cfg.maxErrorRate, "max-error-rate", 0.01, "maximum accepted error ratio from 0 to 1")
+	fs.DurationVar(&cfg.maxP95, "max-p95", 2*time.Second, "maximum accepted p95 latency; 0 disables the check")
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
 	}
@@ -105,7 +122,27 @@ func parseConfig(args []string) (config, error) {
 	if cfg.readyTimeout <= 0 || cfg.requestTimeout <= 0 {
 		return config{}, errors.New("timeouts must be positive")
 	}
+	if cfg.mode != "smoke" && cfg.mode != "load" {
+		return config{}, errors.New("-mode must be smoke or load")
+	}
+	if cfg.loadProfile != "read" && cfg.loadProfile != "mixed" {
+		return config{}, errors.New("-load-profile must be read or mixed")
+	}
+	if cfg.loadDuration <= 0 || cfg.workers <= 0 || cfg.workers > 1000 || cfg.maxOPS < 0 || cfg.maxOPS > 1_000_000 {
+		return config{}, errors.New("load duration and workers must be positive, workers at most 1000, max-ops between 0 and 1000000")
+	}
+	if cfg.maxErrorRate < 0 || cfg.maxErrorRate > 1 || cfg.maxP95 < 0 {
+		return config{}, errors.New("-max-error-rate must be between 0 and 1 and -max-p95 must be non-negative")
+	}
 	return cfg, nil
+}
+
+func newHTTPClient(cfg config) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	idleConnections := max(100, cfg.workers*2)
+	transport.MaxIdleConns = idleConnections
+	transport.MaxIdleConnsPerHost = idleConnections
+	return &http.Client{Timeout: cfg.requestTimeout, Transport: transport}
 }
 
 func envOr(name, fallback string) string {
@@ -138,6 +175,17 @@ func (r *runner) run(ctx context.Context) (runErr error) {
 	}
 	if err := r.step("runtime endpoints", func() error { return r.checkRuntime(ctx) }); err != nil {
 		return err
+	}
+	if r.cfg.mode == "load" {
+		if err := r.runLoad(ctx); err != nil {
+			return err
+		}
+		if err := r.cleanup(ctx); err != nil {
+			return fmt.Errorf("cleanup: %w", err)
+		}
+		cleaned = true
+		fmt.Fprintf(r.out, "stacktest: LOAD PASS (%s)\n", time.Since(started).Round(time.Millisecond))
+		return nil
 	}
 
 	suffix, err := randomSuffix()
@@ -314,6 +362,310 @@ func (r *runner) run(ctx context.Context) (runErr error) {
 	return nil
 }
 
+func (r *runner) runLoad(ctx context.Context) error {
+	suffix, err := randomSuffix()
+	if err != nil {
+		return fmt.Errorf("generate test identity: %w", err)
+	}
+	login := "stload" + suffix
+	password := "Stacktest1!"
+	if err := r.step("load fixture registration", func() error {
+		if err := r.register(ctx, login, password); err != nil {
+			return err
+		}
+		token, err := r.authenticate(ctx, login, password)
+		if err != nil {
+			return err
+		}
+		r.tokens["load"] = token
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	fileName := "stacktest-load-" + suffix + ".bin"
+	fileBody := []byte("stacktest-load-payload")
+	r.trackName(fileName, r.tokens["load"])
+	var fileID string
+	if err := r.step("load fixture upload", func() error {
+		if err := r.upload(ctx, map[string]any{
+			"name": fileName, "file": true, "public": true,
+			"mime": "application/octet-stream", "token": r.tokens["load"], "grant": []string{},
+		}, nil, fileBody); err != nil {
+			return err
+		}
+		items, err := r.listByName(ctx, r.tokens["load"], fileName)
+		if err != nil {
+			return err
+		}
+		if len(items) != 1 {
+			return fmt.Errorf("load fixture lookup returned %d documents, want 1", len(items))
+		}
+		fileID = items[0].ID
+		r.trackDocument(fileID, r.tokens["load"])
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(r.out, "LOAD profile=%s workers=%d duration=%s max-ops=%d\n",
+		r.cfg.loadProfile, r.cfg.workers, r.cfg.loadDuration, r.cfg.maxOPS)
+	stats := newLoadStats(r.cfg.maxP95)
+	loadCtx, cancel := context.WithTimeout(ctx, r.cfg.loadDuration)
+	defer cancel()
+
+	var permits <-chan time.Time
+	var ticker *time.Ticker
+	if r.cfg.maxOPS > 0 {
+		ticker = time.NewTicker(time.Second / time.Duration(r.cfg.maxOPS))
+		defer ticker.Stop()
+		permits = ticker.C
+	}
+	var sequence atomic.Uint64
+	var workers sync.WaitGroup
+	started := time.Now()
+	for worker := 0; worker < r.cfg.workers; worker++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for {
+				if permits != nil {
+					select {
+					case <-loadCtx.Done():
+						return
+					case <-permits:
+					}
+				} else {
+					select {
+					case <-loadCtx.Done():
+						return
+					default:
+					}
+				}
+
+				n := sequence.Add(1)
+				operation := r.pickLoadOperation(n)
+				opStarted := time.Now()
+				err := r.executeLoadOperation(ctx, operation, fileID, fileBody, suffix, n)
+				stats.record(operation, time.Since(opStarted), err)
+			}
+		}()
+	}
+	workers.Wait()
+	elapsed := time.Since(started)
+	result := stats.snapshot()
+	if result.total == 0 {
+		return errors.New("load test completed without operations")
+	}
+
+	fmt.Fprintf(r.out, "RESULT operations=%d success=%d errors=%d ops/s=%.1f error-rate=%.2f%% p50<=%s p95<=%s p99<=%s\n",
+		result.total, result.success, result.errors, float64(result.total)/elapsed.Seconds(),
+		100*result.errorRate(), result.p50, result.p95, result.p99)
+	for _, name := range []string{"get", "head", "list", "mutation"} {
+		if operation := result.operations[name]; operation.total > 0 {
+			fmt.Fprintf(r.out, "  %-8s operations=%d errors=%d\n", name, operation.total, operation.errors)
+		}
+	}
+	for _, example := range result.errorExamples {
+		fmt.Fprintf(r.out, "  error: %s\n", example)
+	}
+	if result.errorRate() > r.cfg.maxErrorRate {
+		return fmt.Errorf("load error rate %.4f exceeds limit %.4f", result.errorRate(), r.cfg.maxErrorRate)
+	}
+	if r.cfg.maxP95 > 0 && result.p95OverLimit {
+		return fmt.Errorf("load p95 %s exceeds limit %s", result.p95, r.cfg.maxP95)
+	}
+	return nil
+}
+
+func (r *runner) pickLoadOperation(sequence uint64) string {
+	position := sequence % 100
+	if r.cfg.loadProfile == "mixed" {
+		switch {
+		case position < 55:
+			return "get"
+		case position < 70:
+			return "head"
+		case position < 85:
+			return "list"
+		default:
+			return "mutation"
+		}
+	}
+	switch {
+	case position < 70:
+		return "get"
+	case position < 85:
+		return "head"
+	default:
+		return "list"
+	}
+}
+
+func (r *runner) executeLoadOperation(ctx context.Context, operation, fileID string, fileBody []byte, suffix string, sequence uint64) error {
+	token := r.tokens["load"]
+	switch operation {
+	case "get":
+		status, header, body, err := r.request(ctx, http.MethodGet, documentPath(fileID, token), nil, "")
+		if err != nil {
+			return err
+		}
+		if err := expectStatus(status, http.StatusOK, body); err != nil {
+			return err
+		}
+		if !bytes.Equal(body, fileBody) || header.Get("Content-Type") != "application/octet-stream" {
+			return errors.New("GET payload mismatch")
+		}
+		return nil
+	case "head":
+		status, header, body, err := r.request(ctx, http.MethodHead, documentPath(fileID, token), nil, "")
+		if err != nil {
+			return err
+		}
+		if status != http.StatusOK || len(body) != 0 || header.Get("Content-Length") != strconv.Itoa(len(fileBody)) {
+			return fmt.Errorf("HEAD contract mismatch: status=%d", status)
+		}
+		return nil
+	case "list":
+		_, err := r.list(ctx, token, "")
+		return err
+	case "mutation":
+		return r.loadMutation(ctx, token, suffix, sequence)
+	default:
+		return fmt.Errorf("unknown load operation %q", operation)
+	}
+}
+
+func (r *runner) loadMutation(ctx context.Context, token, suffix string, sequence uint64) error {
+	name := fmt.Sprintf("stacktest-load-%s-%d.json", suffix, sequence)
+	r.trackName(name, token)
+	if err := r.upload(ctx, map[string]any{
+		"name": name, "file": false, "public": false, "token": token, "grant": []string{},
+	}, json.RawMessage(`{"load":true}`), nil); err != nil {
+		return fmt.Errorf("mutation upload: %w", err)
+	}
+	items, err := r.listByName(ctx, token, name)
+	if err != nil {
+		return fmt.Errorf("mutation lookup: %w", err)
+	}
+	if len(items) != 1 {
+		return fmt.Errorf("mutation lookup returned %d documents", len(items))
+	}
+	id := items[0].ID
+	r.trackDocument(id, token)
+	if err := r.deleteDocument(ctx, id, token); err != nil {
+		return fmt.Errorf("mutation delete: %w", err)
+	}
+	r.forgetDocument(id)
+	r.forgetName(name)
+	return nil
+}
+
+var loadLatencyLimits = []time.Duration{
+	time.Millisecond, 2 * time.Millisecond, 5 * time.Millisecond, 10 * time.Millisecond,
+	20 * time.Millisecond, 50 * time.Millisecond, 100 * time.Millisecond, 200 * time.Millisecond,
+	500 * time.Millisecond, time.Second, 1500 * time.Millisecond, 2 * time.Second,
+	3 * time.Second, 5 * time.Second, 10 * time.Second, 30 * time.Second, time.Hour,
+}
+
+type operationResult struct{ total, errors uint64 }
+
+type loadStats struct {
+	mu            sync.Mutex
+	total         uint64
+	success       uint64
+	errors        uint64
+	buckets       []uint64
+	operations    map[string]operationResult
+	errorExamples []string
+	p95Limit      time.Duration
+	overP95Limit  uint64
+}
+
+type loadResult struct {
+	total, success, errors uint64
+	operations             map[string]operationResult
+	errorExamples          []string
+	p50, p95, p99          string
+	p95Duration            time.Duration
+	p95OverLimit           bool
+}
+
+func newLoadStats(p95Limit time.Duration) *loadStats {
+	return &loadStats{
+		buckets: make([]uint64, len(loadLatencyLimits)), operations: make(map[string]operationResult),
+		p95Limit: p95Limit,
+	}
+}
+
+func (s *loadStats) record(operation string, latency time.Duration, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.total++
+	result := s.operations[operation]
+	result.total++
+	if err == nil {
+		s.success++
+	} else {
+		s.errors++
+		result.errors++
+		if len(s.errorExamples) < 5 {
+			s.errorExamples = append(s.errorExamples, operation+": "+err.Error())
+		}
+	}
+	s.operations[operation] = result
+	if s.p95Limit > 0 && latency > s.p95Limit {
+		s.overP95Limit++
+	}
+	for index, limit := range loadLatencyLimits {
+		if latency <= limit {
+			s.buckets[index]++
+			return
+		}
+	}
+	s.buckets[len(s.buckets)-1]++
+}
+
+func (s *loadStats) snapshot() loadResult {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := loadResult{
+		total: s.total, success: s.success, errors: s.errors,
+		operations:    make(map[string]operationResult, len(s.operations)),
+		errorExamples: append([]string(nil), s.errorExamples...),
+	}
+	for name, operation := range s.operations {
+		result.operations[name] = operation
+	}
+	result.p50, _ = histogramQuantile(s.buckets, s.total, 0.50)
+	result.p95, result.p95Duration = histogramQuantile(s.buckets, s.total, 0.95)
+	result.p99, _ = histogramQuantile(s.buckets, s.total, 0.99)
+	result.p95OverLimit = s.total > 0 && float64(s.overP95Limit)/float64(s.total) > 0.05
+	return result
+}
+
+func (r loadResult) errorRate() float64 {
+	if r.total == 0 {
+		return 0
+	}
+	return float64(r.errors) / float64(r.total)
+}
+
+func histogramQuantile(buckets []uint64, total uint64, quantile float64) (string, time.Duration) {
+	if total == 0 {
+		return "n/a", 0
+	}
+	want := uint64(float64(total)*quantile + 0.999999)
+	var cumulative uint64
+	for index, count := range buckets {
+		cumulative += count
+		if cumulative >= want {
+			return loadLatencyLimits[index].String(), loadLatencyLimits[index]
+		}
+	}
+	return ">" + loadLatencyLimits[len(loadLatencyLimits)-1].String(), loadLatencyLimits[len(loadLatencyLimits)-1]
+}
+
 func (r *runner) step(name string, fn func() error) error {
 	started := time.Now()
 	if err := fn(); err != nil {
@@ -445,6 +797,14 @@ func (r *runner) list(ctx context.Context, token, owner string) ([]listItem, err
 	if owner != "" {
 		query.Set("login", owner)
 	}
+	return r.listQuery(ctx, query)
+}
+
+func (r *runner) listByName(ctx context.Context, token, name string) ([]listItem, error) {
+	return r.listQuery(ctx, url.Values{"token": {token}, "key": {"name"}, "value": {name}})
+}
+
+func (r *runner) listQuery(ctx context.Context, query url.Values) ([]listItem, error) {
 	status, _, body, err := r.request(ctx, http.MethodGet, "/api/docs?"+query.Encode(), nil, "")
 	if err != nil {
 		return nil, err
@@ -517,14 +877,18 @@ func (r *runner) logout(ctx context.Context, token string) error {
 
 func (r *runner) cleanup(ctx context.Context) error {
 	var errs []error
-	known := make(map[string]bool, len(r.docs))
-	for _, doc := range r.docs {
+	r.mu.Lock()
+	docs := append([]ownedDocument(nil), r.docs...)
+	names := append([]ownedName(nil), r.names...)
+	r.mu.Unlock()
+	known := make(map[string]bool, len(docs))
+	for _, doc := range docs {
 		known[doc.id] = true
 	}
 	// Upload responses intentionally do not expose IDs. Discover test documents
 	// by their random names so a failure between upload and normal listing does
 	// not leave blobs behind.
-	for _, target := range r.names {
+	for _, target := range names {
 		items, err := r.list(ctx, target.token, "")
 		if err != nil {
 			errs = append(errs, fmt.Errorf("discover %s: %w", target.name, err))
@@ -532,18 +896,20 @@ func (r *runner) cleanup(ctx context.Context) error {
 		}
 		for _, item := range items {
 			if item.Name == target.name && !known[item.ID] {
-				r.docs = append(r.docs, ownedDocument{item.ID, target.token})
+				docs = append(docs, ownedDocument{item.ID, target.token})
 				known[item.ID] = true
 			}
 		}
 	}
-	r.names = nil
-	for _, doc := range r.docs {
+	for _, doc := range docs {
 		if err := r.deleteDocument(ctx, doc.id, doc.token); err != nil {
 			errs = append(errs, fmt.Errorf("document: %w", err))
 		}
 	}
+	r.mu.Lock()
 	r.docs = nil
+	r.names = nil
+	r.mu.Unlock()
 	for role, token := range r.tokens {
 		if token == "" {
 			continue
@@ -557,9 +923,34 @@ func (r *runner) cleanup(ctx context.Context) error {
 }
 
 func (r *runner) forgetDocument(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	for index, doc := range r.docs {
 		if doc.id == id {
 			r.docs = append(r.docs[:index], r.docs[index+1:]...)
+			return
+		}
+	}
+}
+
+func (r *runner) trackDocument(id, token string) {
+	r.mu.Lock()
+	r.docs = append(r.docs, ownedDocument{id, token})
+	r.mu.Unlock()
+}
+
+func (r *runner) trackName(name, token string) {
+	r.mu.Lock()
+	r.names = append(r.names, ownedName{name, token})
+	r.mu.Unlock()
+}
+
+func (r *runner) forgetName(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for index, item := range r.names {
+		if item.name == name {
+			r.names = append(r.names[:index], r.names[index+1:]...)
 			return
 		}
 	}

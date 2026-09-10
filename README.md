@@ -217,6 +217,7 @@ make test-integration # PostgreSQL repositories и сквозная HTTP-при�
 make test-acceptance # быстрый HTTP + PostgreSQL-приёмка
 make test-container  # runtime-образ, UID/GID и multipart-файлы на диске
 make test-stack      # black-box проверка уже поднятого Docker Compose стека
+make test-load       # отдельный нагрузочный режим для поднятого стека
 ```
 
 ### Black-box проверка поднятой сборки
@@ -248,6 +249,48 @@ go run ./cmd/stacktest
 Доступны флаги `-base-url`, `-admin-token`, `-ready-timeout` и
 `-request-timeout`. Успех завершается кодом `0`, ошибка контракта или
 недоступность сервиса — кодом `1`, ошибка параметров запуска — кодом `2`.
+
+### Нагрузочный режим
+
+Нагрузочный прогон отделён от smoke-сценария флагом `-mode load`. Сначала он
+создаёт пользователя и контрольный бинарный документ, затем запускает
+параллельные операции и в конце удаляет созданные документы и сессии.
+
+Пример преимущественно читающей нагрузки:
+
+```sh
+export ADMIN_TOKEN='local-admin-token-change-me'
+go run ./cmd/stacktest \
+  -mode load \
+  -base-url 'http://127.0.0.1:8080' \
+  -load-profile read \
+  -load-duration 2m \
+  -workers 50 \
+  -max-ops 500
+```
+
+Профиль `read` выполняет 70% GET, 15% HEAD и 15% запросов списка. Профиль
+`mixed` выполняет 55% GET, по 15% HEAD, list и транзакций upload/list/delete.
+`-max-ops` ограничивает число логических операций в секунду для всего теста;
+значение `0` снимает ограничение. Одна mixed-транзакция включает три HTTP-запроса.
+
+Результат содержит число операций, ops/s, error rate и приближённые
+p50/p95/p99. Для CI доступны пороги:
+
+```sh
+export ADMIN_TOKEN='local-admin-token-change-me'
+go run ./cmd/stacktest \
+  -mode load \
+  -base-url 'http://127.0.0.1:8080' \
+  -load-profile mixed \
+  -load-duration 1m \
+  -workers 25 \
+  -max-ops 500 \
+  -max-error-rate 0.01 \
+  -max-p95 2s
+```
+
+При превышении допустимой доли ошибок или p95 команда завершается кодом `1`.
 
 Те же проверки можно выполнить отдельно:
 

@@ -1,7 +1,7 @@
 GO_FILES := $(shell find cmd internal -type f -name '*.go' -print)
 STATICCHECK_VERSION := 2024.1.1
 
-.PHONY: fmt fmt-check test test-fast test-http test-integration test-acceptance test-container test-stack test-race vet staticcheck check tools
+.PHONY: fmt fmt-check test test-fast test-http test-integration test-acceptance test-container test-stack test-load test-race vet staticcheck check tools
 
 fmt:
 	gofmt -w $(GO_FILES)
@@ -31,7 +31,10 @@ test-container:
 # Black-box check for an already running Compose stack. Override BASE_URL and
 # ADMIN_TOKEN when testing anything other than the local demonstration setup.
 test-stack:
-	ADMIN_TOKEN="$${ADMIN_TOKEN:-local-admin-token-change-me}" go run ./cmd/stacktest -base-url "$${BASE_URL:-http://localhost:8080}"
+	ADMIN_TOKEN="$${ADMIN_TOKEN:-local-admin-token-change-me}" go run ./cmd/stacktest -base-url "$${BASE_URL:-http://127.0.0.1:8080}"
+
+test-load:
+	ADMIN_TOKEN="$${ADMIN_TOKEN:-local-admin-token-change-me}" go run ./cmd/stacktest -mode load -base-url "$${BASE_URL:-http://127.0.0.1:8080}" -load-profile "$${LOAD_PROFILE:-read}" -load-duration "$${LOAD_DURATION:-30s}" -workers "$${WORKERS:-16}" -max-ops "$${MAX_OPS:-0}"
 
 test-race:
 	go test -race ./...
