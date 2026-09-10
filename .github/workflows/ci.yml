@@ -39,11 +39,25 @@ jobs:
         run: go install honnef.co/go/tools/cmd/staticcheck@2024.1.1
       - name: Check formatting
         run: make fmt-check
-      - name: Unit and acceptance tests
-        run: make test
+      - name: Fast unit and HTTP tests
+        run: make test-fast
+      - name: PostgreSQL integration and HTTP acceptance tests
+        run: make test-integration
       - name: Race detector
         run: make test-race
       - name: Vet
         run: make vet
       - name: Staticcheck
         run: make staticcheck
+
+  container-acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.23.3'
+          cache: true
+      - name: Runtime image and multipart temporary-file acceptance
+        run: make test-container

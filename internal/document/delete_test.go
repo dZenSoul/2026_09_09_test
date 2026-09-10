@@ -111,6 +111,77 @@ func TestDeletePostCommitOrderAndIndependentCleanupContext(t *testing.T) {
 	}
 }
 
+func TestDeleteOutboxFinishesCleanupAfterEveryPostCommitFailure(t *testing.T) {
+	owner := domain.User{ID: "owner-id", Login: "owner000"}
+	doc := domain.Document{ID: "doc", OwnerID: owner.ID, IsFile: true, StorageKey: "opaque"}
+
+	tests := []struct {
+		name             string
+		blobErrors       []error
+		acknowledgeError error
+	}{
+		{name: "blob deletion fails", blobErrors: []error{errors.New("storage unavailable")}},
+		{name: "database acknowledgement fails", acknowledgeError: errors.New("database unavailable")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			repo := &outboxDeleteRepository{deleteDocuments: &deleteDocuments{document: doc}, acknowledgeError: test.acknowledgeError}
+			storage := &recoveringDeleteStorage{exists: true, errors: append([]error(nil), test.blobErrors...)}
+			service, err := NewService(repo, &fakeUsers{}, storage, Config{
+				MaxFileBytes: 10, MaxGrantItems: 10, Cleanup: repo, CleanupTimeout: time.Second,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := service.Delete(context.Background(), owner, doc.ID); err == nil {
+				t.Fatal("expected the injected post-commit failure")
+			}
+			if !repo.deleted || !repo.taskPending {
+				t.Fatalf("safe state after failure: deleted=%v task=%v", repo.deleted, repo.taskPending)
+			}
+
+			// Restore the failed dependency and run one deterministic outbox pass.
+			repo.acknowledgeError = nil
+			worker, err := NewCleanupWorker(repo, storage, CleanupWorkerConfig{
+				BatchSize: 1, OperationTimeout: time.Second,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			processed, err := worker.ProcessBatch(context.Background())
+			if err != nil || processed != 1 {
+				t.Fatalf("outbox pass = %d, %v", processed, err)
+			}
+			if storage.exists || repo.taskPending {
+				t.Fatalf("cleanup did not converge: blob=%v task=%v", storage.exists, repo.taskPending)
+			}
+		})
+	}
+}
+
+func TestDeleteInvalidationFailureStillFinishesPhysicalCleanup(t *testing.T) {
+	owner := domain.User{ID: "owner-id", Login: "owner000"}
+	repo := &outboxDeleteRepository{deleteDocuments: &deleteDocuments{document: domain.Document{
+		ID: "doc", OwnerID: owner.ID, IsFile: true, StorageKey: "opaque",
+	}}}
+	storage := &recoveringDeleteStorage{exists: true}
+	service, err := NewService(repo, &fakeUsers{}, storage, Config{
+		MaxFileBytes: 10, MaxGrantItems: 10, Cleanup: repo, CleanupTimeout: time.Second,
+		InvalidateDelete: func(context.Context, string) error {
+			return errors.New("cache unavailable")
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Delete(context.Background(), owner, "doc"); err == nil {
+		t.Fatal("expected invalidation error")
+	}
+	if !repo.deleted || storage.exists || repo.taskPending {
+		t.Fatalf("post-invalidation state: deleted=%v blob=%v task=%v", repo.deleted, storage.exists, repo.taskPending)
+	}
+}
+
 type deleteDocuments struct {
 	document    domain.Document
 	byIDErr     error
@@ -206,5 +277,74 @@ func (f *orderedDeleteStorage) Delete(ctx context.Context, _ string) error {
 		return ctx.Err()
 	}
 	*f.order = append(*f.order, "blob")
+	return nil
+}
+
+type outboxDeleteRepository struct {
+	*deleteDocuments
+	taskPending      bool
+	attempts         int
+	acknowledgeError error
+}
+
+func (r *outboxDeleteRepository) Delete(ctx context.Context, id, ownerID string) (domain.Document, error) {
+	document, err := r.deleteDocuments.Delete(ctx, id, ownerID)
+	if err == nil && document.IsFile {
+		r.taskPending = true
+	}
+	return document, err
+}
+
+func (r *outboxDeleteRepository) ClaimBlobCleanupTasks(context.Context, int, time.Time) ([]repository.BlobCleanupTask, error) {
+	if !r.taskPending {
+		return nil, nil
+	}
+	r.attempts++
+	return []repository.BlobCleanupTask{{ID: 1, StorageKey: r.document.StorageKey, Attempts: r.attempts}}, nil
+}
+
+func (r *outboxDeleteRepository) CompleteBlobCleanupTask(context.Context, int64) error {
+	if r.acknowledgeError != nil {
+		return r.acknowledgeError
+	}
+	r.taskPending = false
+	return nil
+}
+
+func (r *outboxDeleteRepository) CompleteBlobCleanupByStorageKey(context.Context, string) error {
+	if r.acknowledgeError != nil {
+		return r.acknowledgeError
+	}
+	r.taskPending = false
+	return nil
+}
+
+func (*outboxDeleteRepository) RetryBlobCleanupTask(context.Context, int64, time.Time) error {
+	return nil
+}
+
+type recoveringDeleteStorage struct {
+	exists bool
+	errors []error
+	calls  int
+}
+
+func (*recoveringDeleteStorage) Put(context.Context, string, io.Reader) (int64, error) {
+	return 0, errors.New("unused")
+}
+func (*recoveringDeleteStorage) Open(context.Context, string) (blob.Object, error) {
+	return blob.Object{}, errors.New("unused")
+}
+func (s *recoveringDeleteStorage) Delete(context.Context, string) error {
+	s.calls++
+	if len(s.errors) != 0 {
+		err := s.errors[0]
+		s.errors = s.errors[1:]
+		return err
+	}
+	if !s.exists {
+		return blob.ErrNotFound
+	}
+	s.exists = false
 	return nil
 }

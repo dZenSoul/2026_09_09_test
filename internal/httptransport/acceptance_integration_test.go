@@ -4,16 +4,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,12 +25,15 @@ import (
 	"documents/internal/blob"
 	responsecache "documents/internal/cache"
 	"documents/internal/document"
+	"documents/internal/repository"
 	postgresrepository "documents/internal/repository/postgres"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"golang.org/x/crypto/bcrypt"
 )
+
+const acceptanceMaxFileBytes int64 = 64
 
 // TestAcceptanceLifecycle exercises the public API through all of its layers:
 // HTTP parsing, authentication, use cases, PostgreSQL, filesystem blobs and
@@ -73,16 +80,23 @@ func TestAcceptanceLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create auth service: %v", err)
 	}
+	cache := responsecache.NewMemory(1<<20, 100)
+	cacheEpoch := &atomic.Uint64{}
 	documentService, err := document.NewService(store.Documents(), store.Users(), blobs, document.Config{
-		MaxFileBytes: 64, MaxGrantItems: 2, MaxListLimit: 2,
+		MaxFileBytes: acceptanceMaxFileBytes, MaxGrantItems: 2, MaxListLimit: 2,
+		Cleanup: store, InvalidateDelete: func(ctx context.Context, id string) error {
+			cacheEpoch.Add(1)
+			cache.Invalidate(ctx, "documents:list", "document:"+id)
+			return ctx.Err()
+		},
 	})
 	if err != nil {
 		t.Fatalf("create document service: %v", err)
 	}
 	h := NewHandler(Dependencies{
 		Auth: authService, Documents: documentService,
-		Cache: responsecache.NewMemory(1<<20, 100), CacheTTL: time.Minute, ExposeCacheHeader: true,
-		Limits: Limits{MaxRequestBytes: 4096, MaxFileBytes: 64, MaxJSONBytes: 64, MaxGrantItems: 2, MaxListLimit: 2},
+		Cache: cache, CacheEpoch: cacheEpoch, CacheTTL: time.Minute, ExposeCacheHeader: true,
+		Limits: Limits{MaxRequestBytes: 4096, MaxFileBytes: acceptanceMaxFileBytes, MaxJSONBytes: 64, MaxGrantItems: 2, MaxListLimit: 2},
 	})
 	server := httptest.NewServer(h)
 	defer server.Close()
@@ -318,6 +332,14 @@ func TestAcceptanceLifecycle(t *testing.T) {
 		"name": "concurrent-00.json", "file": false, "public": false,
 		"token": tokens["bob00001"], "grant": []string{},
 	}, []byte(`{"reuploaded":true}`), nil), http.StatusOK)
+
+	// Exercise both inclusive file-size boundaries through the complete public
+	// API. The maximum payload is generated and verified incrementally so the
+	// test never retains redundant full-size copies.
+	acceptanceFileLifecycle(t, client, server.URL, tokens["alice001"], store, blobs,
+		"boundary.bin", "application/x-empty", 0)
+	acceptanceFileLifecycle(t, client, server.URL, tokens["alice001"], store, blobs,
+		"boundary.bin", "application/octet-stream", acceptanceMaxFileBytes)
 }
 
 type acceptanceListItem struct {
@@ -394,6 +416,188 @@ func acceptanceUploadNoFail(client *http.Client, endpoint string, meta map[strin
 	return client.Do(request)
 }
 
+func acceptanceFileLifecycle(
+	t *testing.T,
+	client *http.Client,
+	baseURL, token string,
+	store *postgresrepository.Store,
+	blobs blob.Storage,
+	name, contentType string,
+	size int64,
+) {
+	t.Helper()
+	response, err := acceptanceUploadStream(client, baseURL+"/api/docs", map[string]any{
+		"name": name, "file": true, "public": false, "token": token,
+		"mime": contentType, "grant": []string{},
+	}, &acceptancePatternReader{remaining: size})
+	if err != nil {
+		t.Fatalf("upload %s (%d bytes): %v", name, size, err)
+	}
+	acceptanceCloseStatus(t, response, http.StatusOK)
+
+	var id string
+	for _, item := range acceptanceList(t, client, baseURL, token, "") {
+		if item.Name == name {
+			id = item.ID
+			break
+		}
+	}
+	if id == "" {
+		t.Fatalf("uploaded boundary file %q is absent from list", name)
+	}
+	metadata, err := store.Documents().ByID(context.Background(), id)
+	if err != nil {
+		t.Fatalf("read boundary metadata: %v", err)
+	}
+	object, err := blobs.Open(context.Background(), metadata.StorageKey)
+	if err != nil || object.Size != size {
+		t.Fatalf("stored boundary blob: size=%d error=%v", object.Size, err)
+	}
+	_ = object.Body.Close()
+
+	response = acceptanceGet(t, client, baseURL+"/api/docs/"+id, token)
+	acceptanceStatus(t, response, http.StatusOK)
+	assertAcceptanceFileHeaders(t, response, name, contentType, size)
+	acceptanceVerifyPattern(t, response.Body, size)
+	_ = response.Body.Close()
+
+	request, _ := http.NewRequest(http.MethodHead, baseURL+"/api/docs/"+id+"?token="+url.QueryEscape(token), nil)
+	response, err = client.Do(request)
+	if err != nil {
+		t.Fatalf("HEAD boundary file: %v", err)
+	}
+	acceptanceStatus(t, response, http.StatusOK)
+	assertAcceptanceFileHeaders(t, response, name, contentType, size)
+	body, readErr := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if readErr != nil || len(body) != 0 {
+		t.Fatalf("HEAD body: length=%d error=%v", len(body), readErr)
+	}
+
+	acceptanceCloseStatus(t, acceptanceForm(t, client, http.MethodDelete, baseURL+"/api/docs/"+id,
+		url.Values{"token": {token}}), http.StatusOK)
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		request, _ = http.NewRequest(method, baseURL+"/api/docs/"+id+"?token="+url.QueryEscape(token), nil)
+		response, err = client.Do(request)
+		if err != nil {
+			t.Fatalf("%s deleted boundary file: %v", method, err)
+		}
+		acceptanceStatus(t, response, http.StatusNotFound)
+	}
+	for _, item := range acceptanceList(t, client, baseURL, token, "") {
+		if item.ID == id {
+			t.Fatalf("deleted boundary file remains in list: %#v", item)
+		}
+	}
+	if _, err := store.Documents().ByID(context.Background(), id); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("deleted boundary metadata error=%v, want not found", err)
+	}
+	if _, err := blobs.Open(context.Background(), metadata.StorageKey); !errors.Is(err, blob.ErrNotFound) {
+		t.Fatalf("deleted boundary blob error=%v, want not found", err)
+	}
+	tasks, err := store.ClaimBlobCleanupTasks(context.Background(), 1, time.Now().Add(time.Minute))
+	if err != nil || len(tasks) != 0 {
+		t.Fatalf("completed boundary cleanup remains in outbox: tasks=%#v error=%v", tasks, err)
+	}
+}
+
+func acceptanceUploadStream(client *http.Client, endpoint string, meta map[string]any, source io.Reader) (*http.Response, error) {
+	pipeReader, pipeWriter := io.Pipe()
+	writer := multipart.NewWriter(pipeWriter)
+	request, err := http.NewRequest(http.MethodPost, endpoint, pipeReader)
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	writeDone := make(chan error, 1)
+	go func() {
+		encodedMeta, marshalErr := json.Marshal(meta)
+		if marshalErr == nil {
+			marshalErr = writer.WriteField("meta", string(encodedMeta))
+		}
+		var part io.Writer
+		if marshalErr == nil {
+			part, marshalErr = writer.CreateFormFile("file", meta["name"].(string))
+		}
+		if marshalErr == nil {
+			_, marshalErr = io.Copy(part, source)
+		}
+		if closeErr := writer.Close(); marshalErr == nil {
+			marshalErr = closeErr
+		}
+		_ = pipeWriter.CloseWithError(marshalErr)
+		writeDone <- marshalErr
+	}()
+	response, requestErr := client.Do(request)
+	writeErr := <-writeDone
+	if requestErr != nil {
+		return nil, requestErr
+	}
+	if writeErr != nil {
+		_ = response.Body.Close()
+		return nil, writeErr
+	}
+	return response, nil
+}
+
+type acceptancePatternReader struct {
+	offset, remaining int64
+}
+
+func (r *acceptancePatternReader) Read(dst []byte) (int, error) {
+	if r.remaining == 0 {
+		return 0, io.EOF
+	}
+	if int64(len(dst)) > r.remaining {
+		dst = dst[:r.remaining]
+	}
+	for i := range dst {
+		dst[i] = byte(((r.offset + int64(i)) * 31) % 251)
+	}
+	r.offset += int64(len(dst))
+	r.remaining -= int64(len(dst))
+	return len(dst), nil
+}
+
+func acceptanceVerifyPattern(t *testing.T, reader io.Reader, size int64) {
+	t.Helper()
+	buffer := make([]byte, 32)
+	var offset int64
+	for {
+		n, err := reader.Read(buffer)
+		for i, value := range buffer[:n] {
+			want := byte(((offset + int64(i)) * 31) % 251)
+			if value != want {
+				t.Fatalf("download byte %d = %d, want %d", offset+int64(i), value, want)
+			}
+		}
+		offset += int64(n)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read boundary download: %v", err)
+		}
+	}
+	if offset != size {
+		t.Fatalf("download length=%d, want %d", offset, size)
+	}
+}
+
+func assertAcceptanceFileHeaders(t *testing.T, response *http.Response, name, contentType string, size int64) {
+	t.Helper()
+	if response.StatusCode != http.StatusOK || response.ContentLength != size ||
+		response.Header.Get("Content-Length") != strconv.FormatInt(size, 10) ||
+		response.Header.Get("Content-Type") != contentType {
+		t.Fatalf("file response: status=%d length=%d headers=%v", response.StatusCode, response.ContentLength, response.Header)
+	}
+	mediaType, parameters, err := mime.ParseMediaType(response.Header.Get("Content-Disposition"))
+	if err != nil || mediaType != "inline" || parameters["filename"] != name {
+		t.Fatalf("Content-Disposition=%q: media=%q params=%v error=%v",
+			response.Header.Get("Content-Disposition"), mediaType, parameters, err)
+	}
+}
+
 func acceptanceGet(t *testing.T, client *http.Client, endpoint, token string) *http.Response {
 	t.Helper()
 	separator := "?"
@@ -440,6 +644,15 @@ func acceptanceStatus(t *testing.T, response *http.Response, want int) {
 	}
 	if want != http.StatusOK {
 		defer response.Body.Close()
+		if response.Request != nil && response.Request.Method == http.MethodHead {
+			body, err := io.ReadAll(response.Body)
+			if err != nil || len(body) != 0 ||
+				response.Header.Get("Content-Type") != "application/json; charset=utf-8" ||
+				response.Header.Get("Content-Length") == "" {
+				t.Fatalf("invalid HEAD error response: read=%v headers=%v body=%q", err, response.Header, body)
+			}
+			return
+		}
 		var envelope map[string]json.RawMessage
 		if err := json.NewDecoder(response.Body).Decode(&envelope); err != nil || len(envelope) != 1 || envelope["error"] == nil {
 			t.Fatalf("invalid error envelope: %v %#v", err, envelope)

@@ -211,7 +211,11 @@ curl -sS -X DELETE "http://localhost:8080/api/auth/$TOKEN" \
 ```sh
 make tools       # однократно устанавливает зафиксированный Staticcheck
 make check       # format, unit/integration tests, race, vet, staticcheck
-make test-container # runtime-образ, UID/GID и multipart-файлы на диске
+make test-fast       # быстрые unit- и HTTP-тесты без внешних сервисов
+make test-http       # только быстрый HTTP-контур
+make test-integration # PostgreSQL repositories и сквозная HTTP-приёмка
+make test-acceptance # быстрый HTTP + PostgreSQL-приёмка
+make test-container  # runtime-образ, UID/GID и multipart-файлы на диске
 ```
 
 Те же проверки можно выполнить отдельно:
@@ -228,11 +232,11 @@ staticcheck ./...
 
 ```sh
 export TEST_POSTGRES_DSN='postgres://documents:test-password@localhost:5432/documents_test?sslmode=disable'
-go test ./...
-go test -race ./...
+make test-integration
+make test-race
 ```
 
-Сквозной тест проходит все семь операций через HTTP, реальные сервисы, PostgreSQL и файловое хранилище; проверяет матрицу доступа, JSON и бинарные данные, фильтры, `HEAD`, кэш, инвалидацию, статусы и конкурентные чтения. CI автоматически поднимает PostgreSQL 18.6 и запускает весь набор.
+Сквозной тест проходит все семь операций через HTTP, реальные сервисы, PostgreSQL и файловое хранилище; проверяет матрицу доступа, JSON и бинарные данные, фильтры, `HEAD`, кэш, инвалидацию, статусы и конкурентные чтения. CI автоматически поднимает PostgreSQL 18.6, запускает быстрые и интеграционные тесты отдельными шагами, а контейнерную приёмку — отдельным обязательным заданием с доступным Docker Engine.
 
 `make test-container` требует доступный Docker Engine. Он собирает и запускает настоящий `scratch` runtime-образ, загружает файл больше `MAX_JSON_BYTES`, скачивает и сравнивает его побайтно, а также проверяет пользователя `65532:65532`, права временного каталога и отсутствие оставшихся multipart-файлов.
 
