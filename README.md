@@ -216,7 +216,38 @@ make test-http       # только быстрый HTTP-контур
 make test-integration # PostgreSQL repositories и сквозная HTTP-приёмка
 make test-acceptance # быстрый HTTP + PostgreSQL-приёмка
 make test-container  # runtime-образ, UID/GID и multipart-файлы на диске
+make test-stack      # black-box проверка уже поднятого Docker Compose стека
 ```
+
+### Black-box проверка поднятой сборки
+
+`cmd/stacktest` — независимый HTTP-клиент, которому не нужен доступ к Docker,
+PostgreSQL или файловой системе контейнера. Он ждёт readiness, проверяет
+liveness и metrics, создаёт уникальных тестовых пользователей и прогоняет
+регистрацию, аутентификацию, загрузку JSON и бинарного файла, матрицу доступа,
+списки, GET/HEAD, удаление и отзыв сессии. Созданные документы и сессии
+удаляются даже при ошибке; уникальные пользователи остаются в базе, поэтому
+утилита предназначена для тестового окружения.
+
+Для Compose с демонстрационными настройками:
+
+```sh
+docker compose up -d --build
+make test-stack
+```
+
+Для другого адреса или секрета передайте параметры через окружение — так
+административный токен не попадёт в список аргументов процесса:
+
+```sh
+BASE_URL=https://test.example.internal \
+ADMIN_TOKEN='replace-with-test-token' \
+go run ./cmd/stacktest
+```
+
+Доступны флаги `-base-url`, `-admin-token`, `-ready-timeout` и
+`-request-timeout`. Успех завершается кодом `0`, ошибка контракта или
+недоступность сервиса — кодом `1`, ошибка параметров запуска — кодом `2`.
 
 Те же проверки можно выполнить отдельно:
 
