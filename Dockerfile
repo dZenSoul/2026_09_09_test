@@ -20,7 +20,7 @@ FROM scratch AS runtime
 
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build --chown=65532:65532 /out/data /data
-COPY --from=build --chown=65532:65532 --chmod=0700 /out/run/documents-tmp /run/documents-tmp
+COPY --from=build --chown=65532:65532 /out/run /run
 COPY --from=build /out/server /usr/local/bin/server
 COPY --from=build /out/migrate /usr/local/bin/migrate
 
